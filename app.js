@@ -4,7 +4,6 @@
 
 const STORE_KEY = 'ruthsCarPool.v1';
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-const ICS_DAYS = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
 const RATE_LABEL = { month: 'per month', week: 'per week', ride: 'per ride' };
 
 const DEFAULT_STATE = {
@@ -19,14 +18,21 @@ const DEFAULT_STATE = {
     cycle: 'month',     // week | month
     cycleDay: 1,        // month: day of month (1-28). week: 0-6 weekday
     dueDays: 7,
-    remindMin: 15,
+    remindMin: 30,
     nextInvoiceNo: 1001,
+    remindParents: true,  // "carpool in 30 min" push to parents who turned on alerts
+    remindMe: false,      // same reminders to Ruth's own ntfy app
+    liveMapHidden: false,
+    alerts30: true,
   },
   riders: [],
   routes: [],
   rides: [],
   invoices: [],
   calendar: [],
+  absences: [],
+  sentReminders: {},
+  liveRun: null,
 };
 
 let state = load();
@@ -40,7 +46,13 @@ function load() {
     const raw = localStorage.getItem(STORE_KEY);
     if (raw) {
       const s = JSON.parse(raw);
-      return { ...structuredClone(DEFAULT_STATE), ...s, settings: { ...DEFAULT_STATE.settings, ...s.settings } };
+      const st = { ...structuredClone(DEFAULT_STATE), ...s, settings: { ...DEFAULT_STATE.settings, ...s.settings } };
+      if (!s.settings.alerts30) { // one-time move from the old 15-minute default to 30 minutes
+        if (st.settings.remindMin === 15) st.settings.remindMin = 30;
+        st.routes.forEach((rt) => { if (rt.remindMin === 15) rt.remindMin = 30; });
+        st.settings.alerts30 = true;
+      }
+      return st;
     }
   } catch (e) { console.warn('load failed', e); }
   return structuredClone(DEFAULT_STATE);
@@ -143,8 +155,8 @@ function mapsLink(stops, destination) {
   return 'https://www.google.com/maps/dir/?' + p.toString();
 }
 // Drop-off: homes in order, then school. Pickup: school first, then each home.
-function routeMapsLink(rt) {
-  const homes = rt.riderIds.map(rider).filter(Boolean).map((r) => r.address);
+function routeMapsLink(rt, date) {
+  const homes = rt.riderIds.map(rider).filter((r) => r && !(date && absenceFor(r.id, date))).map((r) => r.address);
   if (rt.kind === 'pickup' && rt.destination) return mapsLink([rt.destination, ...homes]);
   return mapsLink(homes, rt.destination);
 }
@@ -168,88 +180,24 @@ function invoiceText(inv) {
   ].join('\n');
 }
 
-// ---------- school calendar ----------
+// ---------- school calendar (logic lives in live.js) ----------
 // state.calendar entries: { id, start, end, label, type: 'off' | 'early', time }
 const KIND_LABEL = { dropoff: 'Drop-off', pickup: 'Pickup' };
-function calendarOn(date) {
-  return (state.calendar || []).find((c) => c.start <= date && date <= (c.end || c.start));
-}
-// Time a route runs on a given date, or null if it doesn't run (not a route day, or no school).
-function routeTimeOn(rt, date) {
-  const dow = parseDate(date).getDay();
-  if (!rt.days.includes(dow)) return null;
-  const cal = calendarOn(date);
-  if (cal && cal.type === 'off') return null;
-  if (cal && cal.type === 'early' && rt.kind === 'pickup' && cal.time) return cal.time;
-  return (rt.dayTimes && rt.dayTimes[dow]) || rt.time;
-}
-function routeTimeNote(rt, date) {
-  const cal = calendarOn(date);
-  if (cal && cal.type === 'early' && rt.kind === 'pickup' && cal.time) return cal.label || 'Early dismissal';
-  const dow = parseDate(date).getDay();
-  if (rt.dayTimes && rt.dayTimes[dow]) return `${DAYS[dow]} schedule`;
-  return '';
-}
+const calendarOn = (date) => calOn(state.calendar, date);
+const routeTimeOn = (rt, date) => schedTimeOn(rt, date, state.calendar);
+const routeTimeNote = (rt, date) => schedNote(rt, date, state.calendar);
 
 // ---------- calendar alarms (.ics) ----------
-const icsEsc = (t) => String(t || '').replace(/\\/g, '\\\\').replace(/[,;]/g, (c) => '\\' + c).replace(/\n/g, '\\n');
-const icsStamp = () => new Date().toISOString().replace(/[-:]/g, '').slice(0, 15) + 'Z';
-function icsEvent({ uid, date, time, rrule, exdates, summary, description, location, mins }) {
-  const t = time.replace(':', '') + '00';
-  const out = ['BEGIN:VEVENT', `UID:${uid}`, `DTSTAMP:${icsStamp()}`, `DTSTART:${date.replace(/-/g, '')}T${t}`, 'DURATION:PT30M'];
-  if (rrule) out.push(`RRULE:${rrule}`);
-  if (exdates && exdates.length) out.push(`EXDATE:${exdates.map((d) => d.replace(/-/g, '') + 'T' + t).join(',')}`);
-  out.push(`SUMMARY:${icsEsc(summary)}`, `DESCRIPTION:${icsEsc(description)}`);
-  if (location) out.push(`LOCATION:${icsEsc(location)}`);
-  if (mins > 0) out.push('BEGIN:VALARM', 'ACTION:DISPLAY', `DESCRIPTION:${icsEsc(summary)} in ${mins} min`, `TRIGGER:-PT${mins}M`, 'END:VALARM');
-  out.push('BEGIN:VALARM', 'ACTION:DISPLAY', `DESCRIPTION:${icsEsc(summary)} now`, 'TRIGGER:PT0M', 'END:VALARM', 'END:VEVENT');
-  return out;
+function routeForCalendar(rt) {
+  const riders = rt.riderIds.map(rider).filter(Boolean);
+  return {
+    id: rt.id, kind: rt.kind || 'dropoff', name: rt.name, days: rt.days, time: rt.time, dayTimes: rt.dayTimes,
+    mins: Number(rt.remindMin ?? state.settings.remindMin) || 0, destination: rt.destination,
+    description: `${state.settings.poolName}\n${riders.map((r, i) => `${i + 1}. ${r.name} — ${r.address || 'no address'}`).join('\n')}`,
+  };
 }
-// One calendar file for the given routes. Repeating events skip days off; early
-// dismissals become one-off events at the early time. Covers the next 12 months.
-function buildIcs(routes) {
-  const s = state.settings;
-  const today = isoDate(new Date());
-  const until = addDays(today, 365);
-  const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Ruths Car Pool//EN', 'CALSCALE:GREGORIAN', `X-WR-CALNAME:${icsEsc(s.poolName)}`];
-  for (const rt of routes) {
-    const mins = Number(rt.remindMin ?? s.remindMin) || 0;
-    const riders = rt.riderIds.map(rider).filter(Boolean);
-    const summary = `${KIND_LABEL[rt.kind || 'dropoff']}: ${rt.name}`;
-    const description = `${s.poolName}\n${riders.map((r, i) => `${i + 1}. ${r.name} — ${r.address || 'no address'}`).join('\n')}`;
-    // Group the route's days by their normal time (e.g. Mon–Thu 3:45, Fri 1:30).
-    const groups = {};
-    for (const d of rt.days) { const t = (rt.dayTimes && rt.dayTimes[d]) || rt.time; (groups[t] = groups[t] || []).push(d); }
-    for (const [time, days] of Object.entries(groups)) {
-      let first = today;
-      while (!days.includes(parseDate(first).getDay())) first = addDays(first, 1);
-      const exdates = [];
-      for (let d = first; d <= until; d = addDays(d, 1)) {
-        if (days.includes(parseDate(d).getDay()) && routeTimeOn(rt, d) !== time) exdates.push(d);
-      }
-      lines.push(...icsEvent({
-        uid: `${rt.id}-${time.replace(':', '')}@ruthscarpool`, date: first, time,
-        rrule: `FREQ=WEEKLY;BYDAY=${days.map((d) => ICS_DAYS[d]).join(',')};UNTIL=${until.replace(/-/g, '')}T235959`,
-        exdates, summary, description, location: rt.destination, mins,
-      }));
-    }
-    for (let d = today; d <= until; d = addDays(d, 1)) {
-      const t = routeTimeOn(rt, d);
-      const normal = rt.days.includes(parseDate(d).getDay()) && ((rt.dayTimes && rt.dayTimes[parseDate(d).getDay()]) || rt.time);
-      if (t && t !== normal) {
-        lines.push(...icsEvent({ uid: `${rt.id}-${d}@ruthscarpool`, date: d, time: t, summary: `${summary} (${routeTimeNote(rt, d)})`, description, location: rt.destination, mins }));
-      }
-    }
-  }
-  lines.push('END:VCALENDAR');
-  return lines.join('\r\n');
-}
-function download(name, text, type) {
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([text], { type }));
-  a.download = name; document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
-}
+const buildIcs = (routes) => buildCalendarFile(state.settings.poolName, routes.map(routeForCalendar), state.calendar);
+const download = downloadFile;
 
 // In-app reminders while the app is open (iPhone home-screen apps can show these after permission).
 const fired = new Set();
@@ -276,6 +224,314 @@ function checkReminders() {
   }
 }
 
+// ---------- live tracking & parent alerts (driver side; engine in live.js) ----------
+function liveCfg() {
+  const s = state.settings;
+  if (!s.live || !s.live.key) {
+    s.live = { topic: 'rcp' + randomId(12), key: b64u.enc(crypto.getRandomValues(new Uint8Array(32))) };
+    save();
+  }
+  return s.live;
+}
+const liveOn = () => !!(state.settings.live && state.settings.live.key);
+const familyTopic = (rid) => `${liveCfg().topic}f${rid}`;
+const myTopic = () => `${liveCfg().topic}me`;
+const appBase = () => location.origin + location.pathname.replace(/[^/]*$/, '');
+const trackLink = (r) => { const c = liveCfg(); return `${appBase()}track.html#t=${c.topic}&k=${c.key}&r=${r.id}`; };
+const firstName = (n) => String(n || '').trim().split(/\s+/)[0];
+function nowTime() { return new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
+
+// Look up map coordinates for addresses (once per address, 1 per second as the free service asks).
+let geoBusy = false;
+async function ensureCoords() {
+  if (geoBusy) return;
+  geoBusy = true;
+  try {
+    const items = [...state.riders.map((o) => ({ o, a: o.address })), ...state.routes.map((o) => ({ o, a: o.destination }))];
+    for (const it of items) {
+      if (!it.a || it.o.geoAddr === it.a) continue;
+      it.o.geo = await geocode(it.a).catch(() => null);
+      it.o.geoAddr = it.a;
+      save();
+      await new Promise((r) => setTimeout(r, 1100));
+    }
+  } finally { geoBusy = false; }
+}
+
+// Absences reported by parents (encrypted messages in the inbox topic).
+function absenceFor(rid, date) {
+  const list = (state.absences || []).filter((a) => a.riderId === rid && a.date === date).sort((a, b) => a.at - b.at);
+  const last = list[list.length - 1];
+  return last && !last.cancel ? last : null;
+}
+async function pollInbox() {
+  if (!liveOn()) return;
+  try {
+    const msgs = await relayPoll(liveCfg().topic + 'in', '72h');
+    const fresh = [];
+    for (const m of msgs) {
+      if ((state.absences || []).some((a) => a.id === m.id)) continue;
+      const p = await unseal(liveCfg().key, m.message);
+      if (!p || p.type !== 'absent' || !rider(p.riderId)) continue;
+      (state.absences = state.absences || []).push({ id: m.id, riderId: p.riderId, date: p.date, note: p.note || '', at: m.time * 1000, cancel: !!p.cancel });
+      fresh.push(p);
+    }
+    const cutoff = addDays(isoDate(new Date()), -30);
+    state.absences = (state.absences || []).filter((a) => a.date >= cutoff);
+    if (fresh.length) {
+      save(); render();
+      const p = fresh[fresh.length - 1];
+      toast(`${firstName(rider(p.riderId).name)} ${p.cancel ? 'is riding again' : 'is not riding'} ${niceDate(p.date)}`);
+    }
+  } catch { /* offline — try again later */ }
+}
+
+// Plain-text push alert to a family's ntfy topic (no addresses or locations in these).
+function pushFamily(r, message, title) {
+  if (!liveOn()) return;
+  relayPublish(familyTopic(r.id), message, { title: title || state.settings.poolName, tags: ['oncoming_automobile'], click: appBase() + 'track.html' }).catch(() => {});
+}
+
+// Schedule snapshot so parents' pages can show upcoming runs and build calendar alarms.
+let syncTimer = null;
+function scheduleSync() { clearTimeout(syncTimer); syncTimer = setTimeout(() => { publishSchedule(); scheduleReminders(); }, 2500); }
+async function publishSchedule() {
+  if (!liveOn()) return;
+  const s = state.settings;
+  const today = isoDate(new Date());
+  const snap = {
+    v: 1, type: 'sched', t: Date.now(), pool: s.poolName, o: s.ownerName, ph: s.ownerPhone,
+    names: Object.fromEntries(state.riders.map((r) => [r.id, firstName(r.name)])),
+    routes: state.routes.map((rt) => ({ id: rt.id, kind: rt.kind || 'dropoff', name: rt.name, days: rt.days, time: rt.time, dayTimes: rt.dayTimes || {}, mins: Number(rt.remindMin ?? s.remindMin) || 30, destination: rt.destination, riders: rt.riderIds })),
+    cal: (state.calendar || []).filter((c) => (c.end || c.start) >= today).sort((a, b) => a.start.localeCompare(b.start)).slice(0, 30).map(({ type, label, start, end, time }) => ({ type, label, start, end, time })),
+  };
+  try { await relayPublish(liveCfg().topic, await seal(liveCfg().key, snap)); state.lastSchedPub = Date.now(); save(); } catch {}
+}
+
+// "Carpool in 30 minutes" push reminders, queued on the relay up to ~26 hours ahead.
+async function scheduleReminders() {
+  const s = state.settings;
+  if (!liveOn() || (!s.remindParents && !s.remindMe)) return;
+  const now = Date.now();
+  const sent = (state.sentReminders = state.sentReminders || {});
+  for (const run of upcomingRuns(state.routes, state.calendar, isoDate(new Date()), 2)) {
+    const [h, m] = run.time.split(':').map(Number);
+    const at = parseDate(run.date); at.setHours(h, m, 0, 0);
+    const lead = Number(run.rt.remindMin ?? s.remindMin) || 30;
+    const fire = at.getTime() - lead * 60000;
+    const key = `${run.rt.id}|${run.date}|${run.time}`;
+    if (sent[key] || fire < now + 60000 || fire > now + 26 * 3600000) continue;
+    const kind = KIND_LABEL[run.rt.kind || 'dropoff'];
+    const delay = String(Math.floor(fire / 1000));
+    try {
+      if (s.remindParents) {
+        for (const r of run.rt.riderIds.map(rider).filter(Boolean)) {
+          if (absenceFor(r.id, run.date)) continue;
+          const msg = run.rt.kind === 'pickup'
+            ? `School pickup for ${firstName(r.name)} at ${niceTime(run.time)} — in ${lead} minutes.${run.note ? ' (' + run.note + ')' : ''}`
+            : `Carpool leaves at ${niceTime(run.time)} — please have ${firstName(r.name)} ready in about ${lead} minutes.`;
+          await relayPublish(familyTopic(r.id), msg, { title: `${s.poolName} · ${kind}`, tags: ['alarm_clock'], delay, click: appBase() + 'track.html' });
+        }
+      }
+      if (s.remindMe) await relayPublish(myTopic(), `${kind}: ${run.rt.name} at ${niceTime(run.time)} — in ${lead} minutes.${run.note ? ' (' + run.note + ')' : ''}`, { title: s.poolName, tags: ['alarm_clock'], priority: 4, delay });
+      sent[key] = fire;
+    } catch { break; }
+  }
+  for (const k of Object.keys(sent)) if (sent[k] < now - 2 * 86400000) delete sent[k];
+  save();
+}
+
+// --- the live run ---
+let live = null;
+function liveStops(rt, date) {
+  return rt.riderIds.map(rider).filter(Boolean).map((r) => ({
+    r,
+    status: absenceFor(r.id, date) ? 'a' : state.rides.some((x) => x.date === date && x.routeId === rt.id && x.riderId === r.id) ? 'd' : 'w',
+  }));
+}
+async function startLive(routeId, resume) {
+  if (!('geolocation' in navigator)) return toast('Location is not available on this device');
+  liveCfg();
+  if (live) stopLive(true);
+  const today = isoDate(new Date());
+  live = { routeId, date: today, pos: null, etas: {}, line: null, alerted: new Set((resume && state.liveRun && state.liveRun.alerted) || []), lastPub: 0 };
+  state.liveRun = { routeId, date: today, started: resume && state.liveRun ? state.liveRun.started : Date.now(), alerted: [...live.alerted] };
+  save();
+  ensureCoords().then(() => liveTick());
+  if (Date.now() - (state.lastSchedPub || 0) > 3600000) publishSchedule();
+  live.watch = navigator.geolocation.watchPosition(onLivePos, onLiveErr, { enableHighAccuracy: true, maximumAge: 5000, timeout: 30000 });
+  live.timer = setInterval(liveTick, 30000);
+  keepAwake();
+  const rt = route(routeId);
+  if (!resume) {
+    for (const { r, status } of liveStops(rt, today)) {
+      if (status !== 'w') continue;
+      pushFamily(r, rt.kind === 'pickup'
+        ? `${state.settings.ownerName} is picking up from ${(rt.destination || 'school').split(',')[0]} now.`
+        : `${state.settings.ownerName} is on the way. Tap to see the live map and arrival time.`, 'On the way');
+    }
+    toast('Live — parents can now see you on the map');
+  }
+  tab = 'today'; todayDate = today; render(); renderLive();
+}
+function onLivePos(p) {
+  if (!live) return;
+  const first = !live.pos;
+  live.pos = { lat: +p.coords.latitude.toFixed(5), lng: +p.coords.longitude.toFixed(5), acc: Math.round(p.coords.accuracy), sp: p.coords.speed, t: Date.now() };
+  live.gpsError = null;
+  updateLiveMap();
+  if (first) liveTick();
+}
+function onLiveErr(e) {
+  if (!live) return;
+  if (e.code === 1) { toast('Allow location access for this app to share your live location'); stopLive(true); return; }
+  live.gpsError = 'Waiting for GPS…'; renderLive();
+}
+let ticking = false;
+async function liveTick() {
+  if (!live || ticking) return;
+  ticking = true;
+  try {
+    const rt = route(live.routeId);
+    if (!rt) return stopLive(true);
+    const stops = liveStops(rt, live.date);
+    const pending = stops.filter((s) => s.status === 'w' && s.r.geo);
+    const targets = pending.map((s) => ({ key: s.r.id, geo: s.r.geo }));
+    if (rt.kind !== 'pickup' && rt.geo) targets.push({ key: 'school', geo: rt.geo });
+    if (live.pos && targets.length) {
+      const res = await drivingRoute([live.pos, ...targets.map((t) => t.geo)]).catch(() => null);
+      if (res && live) {
+        let acc = 0; live.etas = {};
+        targets.forEach((t, i) => { acc += res.legs[i] + (i ? 60 : 0); live.etas[t.key] = Math.round(acc); });
+        live.line = res.line;
+      }
+    } else if (live) live.etas = {};
+    if (!live) return;
+    for (const s of pending) {
+      const e = live.etas[s.r.id];
+      if (e != null && e <= 330 && !live.alerted.has(s.r.id + ':5')) {
+        live.alerted.add(s.r.id + ':5');
+        state.liveRun.alerted = [...live.alerted]; save();
+        pushFamily(s.r, rt.kind === 'pickup'
+          ? `${firstName(s.r.name)} will be home in about 5 minutes.`
+          : `${state.settings.ownerName} is about 5 minutes away — please have ${firstName(s.r.name)} ready.`, '5 minutes away');
+      }
+    }
+    await publishLive(rt, stops, 'live');
+    renderLive(); updateLiveMap();
+  } finally { ticking = false; }
+}
+async function publishLive(rt, stops, status) {
+  const s = state.settings;
+  const etas = (live && live.etas) || {};
+  const payload = {
+    v: 1, type: 'live', s: status, t: Date.now(), pool: s.poolName, o: s.ownerName, ph: s.ownerPhone,
+    r: { id: rt.id, n: rt.name, k: rt.kind || 'dropoff' },
+    d: live && live.pos ? { la: live.pos.lat, lo: live.pos.lng, sp: live.pos.sp, at: live.pos.t } : null,
+    st: stops.map(({ r, status: x }) => ({ i: r.id, n: firstName(r.name), la: r.geo && r.geo.lat, lo: r.geo && r.geo.lng, x, e: etas[r.id] ?? null })),
+    sc: rt.destination ? { n: rt.destination.split(',')[0], la: rt.geo && rt.geo.lat, lo: rt.geo && rt.geo.lng, e: etas.school ?? null } : null,
+  };
+  try {
+    await relayPublish(liveCfg().topic, await seal(liveCfg().key, payload));
+    if (live) { live.lastPub = Date.now(); live.relayError = null; }
+  } catch { if (live) live.relayError = 'Connection problem — retrying'; }
+}
+function stopLive(silent) {
+  if (!live) return;
+  const rt = route(live.routeId);
+  const date = live.date;
+  navigator.geolocation.clearWatch(live.watch);
+  clearInterval(live.timer);
+  releaseAwake();
+  if (rt) {
+    const stops = liveStops(rt, date);
+    publishLive(rt, stops, 'ended');
+    if (!silent && rt.kind !== 'pickup') {
+      for (const { r, status } of stops) if (status === 'd') pushFamily(r, `${firstName(r.name)} was dropped off at ${(rt.destination || 'school').split(',')[0]} at ${nowTime()}.`, 'Arrived at school');
+    }
+  }
+  live = null; state.liveRun = null; save();
+  if (liveMap) { liveMap.remove(); liveMap = null; }
+  renderLive(); render();
+}
+// Called when a rider is checked off during a live run.
+function liveRideChanged(routeId, riderId, on) {
+  if (!live || live.routeId !== routeId || !on) return;
+  const rt = route(routeId), r = rider(riderId);
+  pushFamily(r, rt.kind === 'pickup' ? `${firstName(r.name)} was dropped off at home at ${nowTime()}.` : `${firstName(r.name)} was picked up at ${nowTime()}.`, rt.kind === 'pickup' ? 'Dropped off' : 'Picked up');
+  liveTick();
+}
+
+let wakeLock = null;
+async function keepAwake() { try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {} }
+function releaseAwake() { try { wakeLock && wakeLock.release(); } catch {} wakeLock = null; }
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  if (live) { keepAwake(); liveTick(); }
+  pollInbox();
+});
+
+// --- live panel + driver map ---
+let liveMap = null, liveLayers = null;
+function loadLeaflet() {
+  if (window.L) return Promise.resolve();
+  if (loadLeaflet.p) return loadLeaflet.p;
+  const css = document.createElement('link');
+  css.rel = 'stylesheet'; css.href = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css';
+  document.head.appendChild(css);
+  return (loadLeaflet.p = new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js';
+    s.onload = res; s.onerror = rej; document.head.appendChild(s);
+  }));
+}
+function renderLive() {
+  const box = $('#live');
+  if (!live) { box.innerHTML = ''; box.hidden = true; document.body.classList.remove('is-live'); return; }
+  const rt = route(live.routeId);
+  const stops = liveStops(rt, live.date);
+  const next = stops.find((s) => s.status === 'w');
+  const nextEta = next ? live.etas[next.r.id] : live.etas.school;
+  const status = live.gpsError || live.relayError || (live.lastPub ? `Shared ${Math.max(0, Math.round((Date.now() - live.lastPub) / 1000))}s ago` : 'Starting…');
+  box.hidden = false;
+  document.body.classList.add('is-live');
+  if (!$('#liveInfo')) {
+    box.innerHTML = `<div class="livebar"><span class="pulse" aria-hidden="true"></span><div class="grow" id="liveInfo"></div><button data-act="toggleMap" class="ghost light">Map</button><button data-act="stopLive" class="endbtn">End run</button></div><div id="livemap" ${state.settings.liveMapHidden ? 'hidden' : ''}></div>`;
+  }
+  $('#liveInfo').innerHTML = `<b>Live · ${esc(KIND_LABEL[rt.kind || 'dropoff'])}</b><span>${next ? `Next: ${esc(firstName(next.r.name))}${nextEta != null ? ' · ' + etaText(nextEta) : ''}` : rt.destination && rt.kind !== 'pickup' ? `To ${esc(rt.destination.split(',')[0])}${nextEta != null ? ' · ' + etaText(nextEta) : ''}` : 'All stops done'} · ${esc(status)}</span>`;
+  if (!state.settings.liveMapHidden) updateLiveMap();
+}
+async function updateLiveMap() {
+  if (!live || state.settings.liveMapHidden) return;
+  const el = $('#livemap');
+  if (!el) return;
+  try { await loadLeaflet(); } catch { el.textContent = 'Map unavailable offline'; return; }
+  if (!live) return;
+  if (!liveMap) {
+    liveMap = L.map(el, { zoomControl: false, attributionControl: true });
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap' }).addTo(liveMap);
+    liveLayers = L.layerGroup().addTo(liveMap);
+    liveMap.setView(live.pos ? [live.pos.lat, live.pos.lng] : [40.09, -74.22], 14);
+  }
+  liveLayers.clearLayers();
+  const rt = route(live.routeId);
+  const pts = [];
+  if (live.line) L.polyline(live.line, { color: '#1c1a16', weight: 5, opacity: .8 }).addTo(liveLayers);
+  liveStops(rt, live.date).forEach(({ r, status }, i) => {
+    if (!r.geo) return;
+    L.marker([r.geo.lat, r.geo.lng], { icon: L.divIcon({ className: `pin ${status}`, html: status === 'd' ? '✓' : String(i + 1), iconSize: [26, 26] }) }).addTo(liveLayers);
+    if (status === 'w') pts.push([r.geo.lat, r.geo.lng]);
+  });
+  if (rt.geo) L.marker([rt.geo.lat, rt.geo.lng], { icon: L.divIcon({ className: 'pin school', html: 'S', iconSize: [26, 26] }) }).addTo(liveLayers);
+  if (live.pos) {
+    L.marker([live.pos.lat, live.pos.lng], { icon: L.divIcon({ className: 'pin car', html: '', iconSize: [22, 22] }), zIndexOffset: 1000 }).addTo(liveLayers);
+    pts.push([live.pos.lat, live.pos.lng]);
+  }
+  if (pts.length > 1) liveMap.fitBounds(pts, { padding: [30, 30], maxZoom: 16 });
+  else if (pts.length) liveMap.setView(pts[0], 15);
+  setTimeout(() => liveMap && liveMap.invalidateSize(), 50);
+}
+
 // ---------- views ----------
 function render() {
   document.title = state.settings.poolName;
@@ -294,20 +550,16 @@ function timeParts(t) { const s = niceTime(t); const m = s.match(/^(.*?)\s*([AP]
 function stopsHtml(rt, withChecks) {
   const riders = rt.riderIds.map(rider).filter(Boolean);
   const school = rt.destination ? `<li class="dest"><label><span class="stopnum end">${ic('flag')}</span><span class="grow"><span class="stopname">${esc(rt.destination)}</span><span class="stopaddr">${rt.kind === 'pickup' ? 'Pick up at school' : 'Drop off at school'}</span></span></label></li>` : '';
-  if (rt.kind === 'pickup') return `<ol class="road">${school}${riders.map((r, i) => {
+  const homes = riders.map((r, i) => {
+    const away = withChecks && absenceFor(r.id, todayDate);
     const done = withChecks && state.rides.some((x) => x.date === todayDate && x.routeId === rt.id && x.riderId === r.id);
-    const marker = withChecks
-      ? `<input type="checkbox" class="stopcheck" aria-label="${esc(r.name)} rode" data-act="toggleRide" data-route="${rt.id}" data-rider="${r.id}" ${done ? 'checked' : ''}>`
+    const eta = withChecks && live && live.routeId === rt.id && !done && !away ? live.etas[r.id] : null;
+    const marker = away ? '<span class="stopnum away">–</span>'
+      : withChecks ? `<input type="checkbox" class="stopcheck" aria-label="${esc(r.name)} ${rt.kind === 'pickup' ? 'dropped off' : 'picked up'}" data-act="toggleRide" data-route="${rt.id}" data-rider="${r.id}" ${done ? 'checked' : ''}>`
       : `<span class="stopnum">${i + 1}</span>`;
-    return `<li><label>${marker}<span class="grow"><span class="stopname">${esc(r.name)}</span><span class="stopaddr">${esc(r.address || 'No address on file')}</span></span></label></li>`;
-  }).join('')}</ol>`;
-  return `<ol class="road">${riders.map((r, i) => {
-    const done = withChecks && state.rides.some((x) => x.date === todayDate && x.routeId === rt.id && x.riderId === r.id);
-    const marker = withChecks
-      ? `<input type="checkbox" class="stopcheck" aria-label="${esc(r.name)} rode" data-act="toggleRide" data-route="${rt.id}" data-rider="${r.id}" ${done ? 'checked' : ''}>`
-      : `<span class="stopnum">${i + 1}</span>`;
-    return `<li><label>${marker}<span class="grow"><span class="stopname">${esc(r.name)}</span><span class="stopaddr">${esc(r.address || 'No address on file')}</span></span></label></li>`;
-  }).join('')}${school}</ol>`;
+    return `<li class="${away ? 'away' : ''}"><label>${marker}<span class="grow"><span class="stopname">${esc(r.name)}${away ? ' <span class="caltag off">Absent</span>' : ''}${eta != null ? ` <span class="eta">${etaText(eta)}</span>` : ''}</span><span class="stopaddr">${away ? esc(away.note || 'Parent reported not riding') : esc(r.address || 'No address on file')}</span></span></label></li>`;
+  }).join('');
+  return rt.kind === 'pickup' ? `<ol class="road">${school}${homes}</ol>` : `<ol class="road">${homes}${school}</ol>`;
 }
 
 function viewToday() {
@@ -351,6 +603,7 @@ function viewToday() {
   } else if (!routesToday.length) {
     html += `<div class="panel empty"><p>No runs scheduled on ${d.toLocaleDateString(undefined, { weekday: 'long' })}.</p><button class="ghost" data-act="goto" data-tab="routes">Set up routes</button></div>`;
   }
+  const isLiveToday = todayDate === isoDate(new Date());
   for (const rt of routesToday) {
     const riders = rt.riderIds.map(rider).filter(Boolean);
     const time = routeTimeOn(rt, todayDate);
@@ -363,9 +616,12 @@ function viewToday() {
       </div>
       ${stopsHtml(rt, true)}
       <div class="actions">
-        <a class="btn primary" target="_blank" rel="noopener" href="${esc(routeMapsLink(rt))}">${ic('nav')}Navigate</a>
-        <a class="btn" href="${esc(smsLink(riders.map((r) => r.phone), `Hi! ${state.settings.ownerName} here — on my way for ${rt.name} (${niceTime(time)}).`))}">${ic('msg')}On my way</a>
-        <button class="ghost" data-act="markAll" data-route="${rt.id}">${ic('check')}All present</button>
+        ${isLiveToday ? (live && live.routeId === rt.id
+          ? `<button class="livebtn on" data-act="stopLive">${ic('nav')}Live now · End run</button>`
+          : `<button class="livebtn" data-act="goLive" data-route="${rt.id}">${ic('nav')}Start run · share live</button>`) : ''}
+        <a class="btn" target="_blank" rel="noopener" href="${esc(routeMapsLink(rt, todayDate))}">${ic('pin')}Directions</a>
+        <a class="btn" href="${esc(smsLink(riders.filter((r) => !absenceFor(r.id, todayDate)).map((r) => r.phone), `Hi! ${state.settings.ownerName} here — on my way for ${rt.name} (${niceTime(time)}).`))}">${ic('msg')}Text all</a>
+        <button class="ghost" data-act="markAll" data-route="${rt.id}">${ic('check')}${rt.kind === 'pickup' ? 'All dropped off' : 'All picked up'}</button>
       </div>
     </article>`;
   }
@@ -385,6 +641,12 @@ function viewRiders() {
         <div class="grow"><div class="itemname">${esc(r.name)}</div>
           <div class="itemmeta">${r.parent ? esc(r.parent) + ' · ' : ''}${esc(r.address || 'No address')}</div></div>
         <div class="itemright"><div class="amt">${money(r.rate)}</div><div class="itemmeta">${RATE_LABEL[r.rateType]}</div></div>
+      </div>
+      ${r.address && r.geoAddr === r.address && !r.geo ? '<div class="itemmeta warn">Address not found on the map — check the spelling so live arrival times work.</div>' : ''}
+      ${(state.absences || []).filter((a) => a.riderId === r.id && a.date >= isoDate(new Date()) && absenceFor(r.id, a.date) === a).map((a) => `<div class="itemmeta"><span class="caltag off">Absent</span> ${niceDate(a.date)}${a.note ? ' — ' + esc(a.note) : ''}</div>`).join('')}
+      <div class="itemfoot">
+        ${r.phone ? `<button class="small-btn" data-act="sendLink" data-id="${r.id}">${ic('nav')}Text parent link</button>` : ''}
+        <button class="textbtn" data-act="copyLink" data-id="${r.id}">Copy link</button>
       </div>
       <div class="itemfoot">
         ${bal ? `<span class="tag due">Owes ${money(bal)}</span>` : '<span class="tag">Paid up</span>'}
@@ -523,10 +785,24 @@ function viewSettings() {
       <div><label>Default alarm (min before)</label><input data-set="remindMin" type="number" min="0" value="${esc(s.remindMin)}"></div>
     </div>
   </div>
-  <h2>Reminders</h2>
+  <h2>Reminders &amp; alerts</h2>
   <div class="panel pad">
-    <div class="muted">Best on iPhone: on the Routes tab tap <b>"Add alarm to iPhone calendar"</b> — the alarm then rings even when this app is closed.</div>
-    <div class="actions"><button data-act="notify">${ic('bell')}Enable notifications (${notif})</button></div>
+    <p class="muted">Your own alarms: on the Routes tab tap <b>Set all alarms</b>. They ring ${esc(s.remindMin)} minutes before each run (change it above or per route), even when this app is closed.</p>
+    <label class="switch"><input type="checkbox" data-set="remindParents" ${s.remindParents ? 'checked' : ''}><span>Send parents a push alert ${esc(s.remindMin)} min before each carpool</span></label>
+    <label class="switch"><input type="checkbox" data-set="remindMe" ${s.remindMe ? 'checked' : ''}><span>Also send those push alerts to my phone</span></label>
+    ${s.remindMe ? `<div class="howto">
+      <b>Set up push alerts on your iPhone (one time)</b>
+      <ol><li>Install the free <a href="https://apps.apple.com/app/ntfy/id1625396347" target="_blank" rel="noopener">ntfy</a> app and allow notifications.</li>
+      <li>Tap <b>+</b>, then paste this topic name: <code>${esc(myTopic())}</code> <button class="textbtn" data-act="copyText" data-text="${esc(myTopic())}">Copy</button></li>
+      <li>Tap <b>Subscribe</b>, then come back and <button class="textbtn" data-act="testAlert">send a test alert</button>.</li></ol>
+    </div>` : ''}
+    <div class="actions"><button class="ghost" data-act="notify">${ic('bell')}Alerts while this app is open (${notif})</button></div>
+  </div>
+  <h2>Parent links &amp; live tracking</h2>
+  <div class="panel pad">
+    <p class="muted">Each family gets a private link (Riders tab → <b>Text parent link</b>). On it they see your live location and arrival time during a run, the carpool schedule, and can tell you when their child isn't riding. Locations are encrypted, so only people with a link can see them.</p>
+    <p class="muted">During a run, keep this app open on screen (in a phone mount). iPhone stops sharing location from web apps that are in the background.</p>
+    <div class="actions"><button class="danger ghost" data-act="resetLinks">Make new links (old links stop working)</button></div>
   </div>
   <h2>Backup</h2>
   <div class="panel pad">
@@ -586,6 +862,7 @@ function riderForm(r) {
     const obj = { name: d.name.trim(), parent: d.parent.trim(), phone: d.phone.trim(), email: d.email.trim(), address: d.address.trim(), rate: +d.rate || 0, rateType: d.rateType, notes: d.notes };
     if (isNew) state.riders.push({ id: uid(), ...obj }); else Object.assign(r, obj);
     toast('Saved');
+    setTimeout(ensureCoords, 300); scheduleSync();
   });
 }
 
@@ -623,6 +900,7 @@ function routeForm(rt) {
     const obj = { kind: d.kind || 'dropoff', name: d.name.trim(), days: d._days, time: d.time, dayTimes: dts, remindMin: +d.remindMin, destination: d.destination.trim(), riderIds };
     if (isNew) state.routes.push({ id: uid(), ...obj }); else Object.assign(rt, obj);
     toast('Route saved — tap “Set all alarms” to update your iPhone');
+    setTimeout(ensureCoords, 300); scheduleSync();
   });
 }
 
@@ -644,6 +922,7 @@ function calForm(c, type) {
     state.calendar = state.calendar || [];
     if (isNew) state.calendar.push({ id: uid(), ...obj }); else Object.assign(c, obj);
     toast('Saved — tap “Set all alarms” to update your iPhone');
+    scheduleSync();
   });
 }
 
@@ -703,9 +982,33 @@ const actions = {
   shiftWeek: (el) => { todayDate = addDays(todayDate, +el.dataset.n); render(); },
   markAll: (el) => {
     const rt = route(el.dataset.route);
-    rt.riderIds.forEach((rid) => setRide(rt.id, rid, true));
-    save(); render(); toast('All riders checked in');
+    rt.riderIds.filter((rid) => rider(rid) && !absenceFor(rid, todayDate)).forEach((rid) => {
+      const was = state.rides.some((x) => x.date === todayDate && x.routeId === rt.id && x.riderId === rid);
+      setRide(rt.id, rid, true);
+      if (!was) liveRideChanged(rt.id, rid, true);
+    });
+    save(); render(); toast(rt.kind === 'pickup' ? 'All dropped off' : 'All picked up');
   },
+  goLive: (el) => startLive(el.dataset.route),
+  stopLive: () => { if (confirm('End this run? Parents will see that the run is finished.')) stopLive(); },
+  toggleMap: () => { state.settings.liveMapHidden = !state.settings.liveMapHidden; save(); const m = $('#livemap'); if (m) m.hidden = state.settings.liveMapHidden; if (!m.hidden) updateLiveMap(); },
+  sendLink: (el) => {
+    const r = rider(el.dataset.id);
+    const body = `Hi${r.parent ? ' ' + firstName(r.parent) : ''}! Here is your private ${state.settings.poolName} page for ${firstName(r.name)}: live map and arrival time, carpool schedule, alerts, and a button to tell me when ${firstName(r.name)} isn't riding.\n${trackLink(r)}`;
+    location.href = smsLink(r.phone, body);
+    scheduleSync();
+  },
+  copyLink: async (el) => {
+    const link = trackLink(rider(el.dataset.id));
+    try { await navigator.clipboard.writeText(link); toast('Link copied'); } catch { prompt('Copy this link:', link); }
+    scheduleSync();
+  },
+  copyText: async (el) => { try { await navigator.clipboard.writeText(el.dataset.text); toast('Copied'); } catch { prompt('Copy:', el.dataset.text); } },
+  resetLinks: () => {
+    if (!confirm('Make new private links? Every link you already sent to parents will stop working, and their alert subscriptions must be set up again.')) return;
+    state.settings.live = null; liveCfg(); scheduleSync(); render(); toast('New links created — send them to parents again');
+  },
+  testAlert: () => { relayPublish(myTopic(), 'Test alert from your carpool app — it works!', { title: state.settings.poolName, tags: ['white_check_mark'] }).then(() => toast('Test alert sent')).catch(() => toast('Could not reach the alert service')); },
   newInvoice: () => invoiceForm(),
   billAll: () => {
     const made = [];
@@ -757,6 +1060,9 @@ document.addEventListener('click', (e) => {
 });
 document.addEventListener('change', (e) => {
   const el = e.target;
+  if (el.dataset.set && el.type === 'checkbox') {
+    state.settings[el.dataset.set] = el.checked; save(); scheduleSync(); toast('Saved'); return;
+  }
   if (el.dataset.set) {
     const num = ['cycleDay', 'dueDays', 'remindMin'].includes(el.dataset.set);
     state.settings[el.dataset.set] = num ? +el.value : el.value.trim();
@@ -765,7 +1071,10 @@ document.addEventListener('change', (e) => {
   }
   switch (el.dataset.act) {
     case 'setDate': todayDate = el.value || isoDate(new Date()); render(); break;
-        case 'toggleRide': if (setRide(el.dataset.route, el.dataset.rider, el.checked) === false) el.checked = true; save(); break;
+        case 'toggleRide':
+      if (setRide(el.dataset.route, el.dataset.rider, el.checked) === false) el.checked = true;
+      else liveRideChanged(el.dataset.route, el.dataset.rider, el.checked);
+      save(); break;
     case 'import': {
       const f = el.files[0]; if (!f) return;
       f.text().then((t) => {
@@ -784,8 +1093,8 @@ function loadDemo() {
   const c = { id: uid(), name: 'Moshe Klein', parent: 'Rivka Klein', phone: '555-201-3333', email: '', address: '7 Pine Ct, Lakewood, NJ', rate: 150, rateType: 'month', notes: '' };
   state.riders.push(a, b, c);
   state.routes.push(
-    { id: uid(), kind: 'dropoff', name: 'School — morning', days: [0, 1, 2, 3, 4, 5], time: '07:30', dayTimes: {}, remindMin: 15, destination: 'Main Street School, Lakewood, NJ', riderIds: [a.id, b.id, c.id] },
-    { id: uid(), kind: 'pickup', name: 'School — afternoon', days: [0, 1, 2, 3, 4, 5], time: '15:45', dayTimes: { 5: '12:30' }, remindMin: 20, destination: 'Main Street School, Lakewood, NJ', riderIds: [c.id, b.id, a.id] },
+    { id: uid(), kind: 'dropoff', name: 'School — morning', days: [0, 1, 2, 3, 4, 5], time: '07:30', dayTimes: {}, remindMin: 30, destination: 'Main Street School, Lakewood, NJ', riderIds: [a.id, b.id, c.id] },
+    { id: uid(), kind: 'pickup', name: 'School — afternoon', days: [0, 1, 2, 3, 4, 5], time: '15:45', dayTimes: { 5: '12:30' }, remindMin: 30, destination: 'Main Street School, Lakewood, NJ', riderIds: [c.id, b.id, a.id] },
   );
   const t = isoDate(new Date());
   state.calendar = [
@@ -798,4 +1107,12 @@ function loadDemo() {
 document.querySelectorAll('[data-ic]').forEach((el) => (el.innerHTML = ic(el.dataset.ic)));
 render();
 setInterval(checkReminders, 30000); checkReminders();
+ensureCoords();
+pollInbox(); setInterval(pollInbox, 120000);
+if (liveOn() && Date.now() - (state.lastSchedPub || 0) > 6 * 3600000) scheduleSync();
+else if (liveOn()) scheduleReminders();
+// Resume a run that was live when the app was closed or reloaded (within 3 hours).
+if (state.liveRun && state.liveRun.date === isoDate(new Date()) && Date.now() - state.liveRun.started < 3 * 3600000 && route(state.liveRun.routeId)) startLive(state.liveRun.routeId, true);
+else if (state.liveRun) { state.liveRun = null; save(); }
+setInterval(() => { if (live) renderLive(); }, 5000);
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});

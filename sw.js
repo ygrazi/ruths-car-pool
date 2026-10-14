@@ -1,6 +1,6 @@
 // Network first so updates appear right away; cached copy is used when offline.
-const CACHE = 'ruths-carpool-v3';
-const FILES = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.json', 'icon.svg', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
+const CACHE = 'ruths-carpool-v4';
+const FILES = ['./', 'index.html', 'track.html', 'styles.css', 'live.js', 'app.js', 'track.js', 'manifest.json', 'icon.svg', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES)).then(() => self.skipWaiting()));
