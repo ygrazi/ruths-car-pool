@@ -5,7 +5,8 @@ A carpool management app that runs in any web browser and installs on iPhone lik
 ## Features
 - **Schedule** — today's routes, check off who rode, one-tap navigation and "On my way" group text
 - **Riders** — name, parent/payer, phone, email, pickup address, rate (monthly per person by default; weekly or per-ride also supported)
-- **Routes & alarms** — pickup order, days, time, destination; multi-stop Google Maps directions; "Add alarm to calendar" sets a repeating iPhone Calendar alarm that rings even when the app is closed
+- **Routes & alarms** — separate drop-off and pickup runs, pickup order, days, usual time plus different times on certain days (e.g. early Friday pickup); multi-stop Google Maps directions. "Set all alarms" adds every run to the iPhone Calendar with alerts, so they ring even when the app is closed
+- **School calendar** — days off, breaks and early-dismissal dates. The week strip marks no-carpool days; alarms skip days off and use the early pickup time on half days
 - **Billing** — one tap to invoice all riders for the month, text or email the invoice with Zelle/Venmo payment instructions, mark paid (Zelle, cash, Venmo, check), outstanding/overdue totals, next bill date
 - **Backup** — export/import all data as a file
 

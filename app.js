@@ -26,6 +26,7 @@ const DEFAULT_STATE = {
   routes: [],
   rides: [],
   invoices: [],
+  calendar: [],
 };
 
 let state = load();
@@ -141,6 +142,12 @@ function mapsLink(stops, destination) {
   if (addrs.length) p.set('waypoints', addrs.join('|'));
   return 'https://www.google.com/maps/dir/?' + p.toString();
 }
+// Drop-off: homes in order, then school. Pickup: school first, then each home.
+function routeMapsLink(rt) {
+  const homes = rt.riderIds.map(rider).filter(Boolean).map((r) => r.address);
+  if (rt.kind === 'pickup' && rt.destination) return mapsLink([rt.destination, ...homes]);
+  return mapsLink(homes, rt.destination);
+}
 function paymentLines(amount) {
   const s = state.settings;
   const lines = [];
@@ -161,27 +168,80 @@ function invoiceText(inv) {
   ].join('\n');
 }
 
+// ---------- school calendar ----------
+// state.calendar entries: { id, start, end, label, type: 'off' | 'early', time }
+const KIND_LABEL = { dropoff: 'Drop-off', pickup: 'Pickup' };
+function calendarOn(date) {
+  return (state.calendar || []).find((c) => c.start <= date && date <= (c.end || c.start));
+}
+// Time a route runs on a given date, or null if it doesn't run (not a route day, or no school).
+function routeTimeOn(rt, date) {
+  const dow = parseDate(date).getDay();
+  if (!rt.days.includes(dow)) return null;
+  const cal = calendarOn(date);
+  if (cal && cal.type === 'off') return null;
+  if (cal && cal.type === 'early' && rt.kind === 'pickup' && cal.time) return cal.time;
+  return (rt.dayTimes && rt.dayTimes[dow]) || rt.time;
+}
+function routeTimeNote(rt, date) {
+  const cal = calendarOn(date);
+  if (cal && cal.type === 'early' && rt.kind === 'pickup' && cal.time) return cal.label || 'Early dismissal';
+  const dow = parseDate(date).getDay();
+  if (rt.dayTimes && rt.dayTimes[dow]) return `${DAYS[dow]} schedule`;
+  return '';
+}
+
 // ---------- calendar alarms (.ics) ----------
-function routeIcs(rt) {
+const icsEsc = (t) => String(t || '').replace(/\\/g, '\\\\').replace(/[,;]/g, (c) => '\\' + c).replace(/\n/g, '\\n');
+const icsStamp = () => new Date().toISOString().replace(/[-:]/g, '').slice(0, 15) + 'Z';
+function icsEvent({ uid, date, time, rrule, exdates, summary, description, location, mins }) {
+  const t = time.replace(':', '') + '00';
+  const out = ['BEGIN:VEVENT', `UID:${uid}`, `DTSTAMP:${icsStamp()}`, `DTSTART:${date.replace(/-/g, '')}T${t}`, 'DURATION:PT30M'];
+  if (rrule) out.push(`RRULE:${rrule}`);
+  if (exdates && exdates.length) out.push(`EXDATE:${exdates.map((d) => d.replace(/-/g, '') + 'T' + t).join(',')}`);
+  out.push(`SUMMARY:${icsEsc(summary)}`, `DESCRIPTION:${icsEsc(description)}`);
+  if (location) out.push(`LOCATION:${icsEsc(location)}`);
+  if (mins > 0) out.push('BEGIN:VALARM', 'ACTION:DISPLAY', `DESCRIPTION:${icsEsc(summary)} in ${mins} min`, `TRIGGER:-PT${mins}M`, 'END:VALARM');
+  out.push('BEGIN:VALARM', 'ACTION:DISPLAY', `DESCRIPTION:${icsEsc(summary)} now`, 'TRIGGER:PT0M', 'END:VALARM', 'END:VEVENT');
+  return out;
+}
+// One calendar file for the given routes. Repeating events skip days off; early
+// dismissals become one-off events at the early time. Covers the next 12 months.
+function buildIcs(routes) {
   const s = state.settings;
-  const [h, m] = (rt.time || '07:30').split(':');
-  const start = new Date(); // next matching weekday
-  for (let i = 0; i < 7 && !rt.days.includes(start.getDay()); i++) start.setDate(start.getDate() + 1);
-  const ymd = isoDate(start).replace(/-/g, '');
-  const stops = rt.riderIds.map(rider).filter(Boolean).map((r) => `${r.name} — ${r.address || 'no address'}`).join('\\n');
-  const mins = Number(rt.remindMin ?? s.remindMin) || 15;
-  const lines = [
-    'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Ruths Car Pool//EN', 'BEGIN:VEVENT',
-    `UID:${rt.id}@ruthscarpool`, `DTSTAMP:${new Date().toISOString().replace(/[-:]/g, '').slice(0, 15)}Z`,
-    `DTSTART:${ymd}T${h}${m}00`, 'DURATION:PT45M',
-    `RRULE:FREQ=WEEKLY;BYDAY=${rt.days.map((d) => ICS_DAYS[d]).join(',')}`,
-    `SUMMARY:${s.poolName}: ${rt.name}`,
-    `DESCRIPTION:Pickups:\\n${stops}`,
-    `LOCATION:${(rt.destination || '').replace(/,/g, '\\,')}`,
-    'BEGIN:VALARM', 'ACTION:DISPLAY', `DESCRIPTION:${rt.name} in ${mins} min`, `TRIGGER:-PT${mins}M`, 'END:VALARM',
-    'BEGIN:VALARM', 'ACTION:DISPLAY', `DESCRIPTION:${rt.name} now`, 'TRIGGER:PT0M', 'END:VALARM',
-    'END:VEVENT', 'END:VCALENDAR',
-  ];
+  const today = isoDate(new Date());
+  const until = addDays(today, 365);
+  const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Ruths Car Pool//EN', 'CALSCALE:GREGORIAN', `X-WR-CALNAME:${icsEsc(s.poolName)}`];
+  for (const rt of routes) {
+    const mins = Number(rt.remindMin ?? s.remindMin) || 0;
+    const riders = rt.riderIds.map(rider).filter(Boolean);
+    const summary = `${KIND_LABEL[rt.kind || 'dropoff']}: ${rt.name}`;
+    const description = `${s.poolName}\n${riders.map((r, i) => `${i + 1}. ${r.name} — ${r.address || 'no address'}`).join('\n')}`;
+    // Group the route's days by their normal time (e.g. Mon–Thu 3:45, Fri 1:30).
+    const groups = {};
+    for (const d of rt.days) { const t = (rt.dayTimes && rt.dayTimes[d]) || rt.time; (groups[t] = groups[t] || []).push(d); }
+    for (const [time, days] of Object.entries(groups)) {
+      let first = today;
+      while (!days.includes(parseDate(first).getDay())) first = addDays(first, 1);
+      const exdates = [];
+      for (let d = first; d <= until; d = addDays(d, 1)) {
+        if (days.includes(parseDate(d).getDay()) && routeTimeOn(rt, d) !== time) exdates.push(d);
+      }
+      lines.push(...icsEvent({
+        uid: `${rt.id}-${time.replace(':', '')}@ruthscarpool`, date: first, time,
+        rrule: `FREQ=WEEKLY;BYDAY=${days.map((d) => ICS_DAYS[d]).join(',')};UNTIL=${until.replace(/-/g, '')}T235959`,
+        exdates, summary, description, location: rt.destination, mins,
+      }));
+    }
+    for (let d = today; d <= until; d = addDays(d, 1)) {
+      const t = routeTimeOn(rt, d);
+      const normal = rt.days.includes(parseDate(d).getDay()) && ((rt.dayTimes && rt.dayTimes[parseDate(d).getDay()]) || rt.time);
+      if (t && t !== normal) {
+        lines.push(...icsEvent({ uid: `${rt.id}-${d}@ruthscarpool`, date: d, time: t, summary: `${summary} (${routeTimeNote(rt, d)})`, description, location: rt.destination, mins }));
+      }
+    }
+  }
+  lines.push('END:VCALENDAR');
   return lines.join('\r\n');
 }
 function download(name, text, type) {
@@ -197,15 +257,16 @@ function checkReminders() {
   const now = new Date();
   const today = isoDate(now);
   for (const rt of state.routes) {
-    if (!rt.days.includes(now.getDay()) || !rt.time) continue;
-    const [h, m] = rt.time.split(':').map(Number);
+    const time = routeTimeOn(rt, today);
+    if (!time) continue;
+    const [h, m] = time.split(':').map(Number);
     const at = new Date(now); at.setHours(h, m, 0, 0);
     const mins = Number(rt.remindMin ?? state.settings.remindMin) || 15;
     const diff = (at - now) / 60000;
     const key = `${rt.id}-${today}`;
     if (diff <= mins && diff > -5 && !fired.has(key)) {
       fired.add(key);
-      const msg = `${rt.name} at ${niceTime(rt.time)} — ${Math.max(0, Math.round(diff))} min`;
+      const msg = `${KIND_LABEL[rt.kind || 'dropoff']}: ${rt.name} at ${niceTime(time)} (${Math.max(0, Math.round(diff))} min)`;
       toast(msg);
       if ('Notification' in window && Notification.permission === 'granted') {
         navigator.serviceWorker?.ready.then((reg) => reg.showNotification(state.settings.poolName, { body: msg, icon: 'icon-180.png' }))
@@ -224,129 +285,218 @@ function render() {
   v.innerHTML = ({ today: viewToday, riders: viewRiders, routes: viewRoutes, billing: viewBilling, settings: viewSettings })[tab]();
 }
 
+function ledger(items) {
+  return `<div class="ledger">${items.map(([label, value, cls]) => `<div><span>${label}</span><b class="${cls || ''}">${value}</b></div>`).join('')}</div>`;
+}
+function shortDate(s) { return parseDate(s).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }); }
+function timeParts(t) { const s = niceTime(t); const m = s.match(/^(.*?)\s*([AP]M)$/i); return m ? [m[1], m[2]] : [s, '']; }
+
+function stopsHtml(rt, withChecks) {
+  const riders = rt.riderIds.map(rider).filter(Boolean);
+  const school = rt.destination ? `<li class="dest"><label><span class="stopnum end">${ic('flag')}</span><span class="grow"><span class="stopname">${esc(rt.destination)}</span><span class="stopaddr">${rt.kind === 'pickup' ? 'Pick up at school' : 'Drop off at school'}</span></span></label></li>` : '';
+  if (rt.kind === 'pickup') return `<ol class="road">${school}${riders.map((r, i) => {
+    const done = withChecks && state.rides.some((x) => x.date === todayDate && x.routeId === rt.id && x.riderId === r.id);
+    const marker = withChecks
+      ? `<input type="checkbox" class="stopcheck" aria-label="${esc(r.name)} rode" data-act="toggleRide" data-route="${rt.id}" data-rider="${r.id}" ${done ? 'checked' : ''}>`
+      : `<span class="stopnum">${i + 1}</span>`;
+    return `<li><label>${marker}<span class="grow"><span class="stopname">${esc(r.name)}</span><span class="stopaddr">${esc(r.address || 'No address on file')}</span></span></label></li>`;
+  }).join('')}</ol>`;
+  return `<ol class="road">${riders.map((r, i) => {
+    const done = withChecks && state.rides.some((x) => x.date === todayDate && x.routeId === rt.id && x.riderId === r.id);
+    const marker = withChecks
+      ? `<input type="checkbox" class="stopcheck" aria-label="${esc(r.name)} rode" data-act="toggleRide" data-route="${rt.id}" data-rider="${r.id}" ${done ? 'checked' : ''}>`
+      : `<span class="stopnum">${i + 1}</span>`;
+    return `<li><label>${marker}<span class="grow"><span class="stopname">${esc(r.name)}</span><span class="stopaddr">${esc(r.address || 'No address on file')}</span></span></label></li>`;
+  }).join('')}${school}</ol>`;
+}
+
 function viewToday() {
-  const dow = parseDate(todayDate).getDay();
-  const routesToday = state.routes.filter((r) => r.days.includes(dow)).sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+  const d = parseDate(todayDate);
+  const dow = d.getDay();
+  const isToday = todayDate === isoDate(new Date());
+  const cal = calendarOn(todayDate);
+  const routesToday = state.routes.filter((r) => routeTimeOn(r, todayDate)).sort((a, b) => routeTimeOn(a, todayDate).localeCompare(routeTimeOn(b, todayDate)));
   const owed = state.invoices.filter((i) => i.status !== 'paid').reduce((a, i) => a + i.total, 0);
   const overdue = state.invoices.filter((i) => invoiceStatus(i) === 'overdue').length;
+  // Week strip: Sunday–Saturday of the selected date's week
+  const weekStart = addDays(todayDate, -dow);
+  const week = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i)).map((day) => {
+    const c = calendarOn(day);
+    const runs = state.routes.filter((r) => routeTimeOn(r, day)).length;
+    const cls = [day === todayDate ? 'sel' : '', day === isoDate(new Date()) ? 'now' : '', c && c.type === 'off' ? 'off' : '', c && c.type === 'early' ? 'early' : '', !runs && !(c && c.type === 'off') ? 'none' : ''].join(' ');
+    return `<button class="wd ${cls}" data-act="pickDay" data-d="${day}" title="${esc(c ? c.label : runs + ' runs')}"><span>${DAYS[parseDate(day).getDay()][0]}</span><b>${parseDate(day).getDate()}</b><i></i></button>`;
+  }).join('');
+  const upcoming = (state.calendar || []).filter((c) => (c.end || c.start) >= isoDate(new Date())).sort((a, b) => a.start.localeCompare(b.start)).slice(0, 3);
   let html = `
-    <div class="stats">
-      <div class="stat"><b class="money">${money(owed)}</b><span>Owed to you</span></div>
-      <div class="stat"><b>${overdue}</b><span>Overdue bills</span></div>
-      <div class="stat"><b>${niceDate(nextBillDate()).replace(/^\w+, /, '')}</b><span>Next bill date</span></div>
+    <section class="dayhead">
+      <div>
+        <div class="eyebrow">${isToday ? 'Today' : 'Schedule for'}</div>
+        <div class="display">${d.toLocaleDateString(undefined, { weekday: 'long' })}</div>
+        <div class="sub">${d.toLocaleDateString(undefined, { month: 'long', day: 'numeric', year: 'numeric' })}</div>
+      </div>
+      <label class="datepick">Change<input type="date" value="${todayDate}" data-act="setDate"></label>
+    </section>
+    <div class="week">
+      <button class="wknav" data-act="shiftWeek" data-n="-7" aria-label="Previous week">‹</button>${week}<button class="wknav" data-act="shiftWeek" data-n="7" aria-label="Next week">›</button>
     </div>
-    <h2>
-      <span>Schedule</span>
-      <input type="date" value="${todayDate}" data-act="setDate" style="width:auto">
-    </h2>`;
+    <div class="legend"><span class="k off"></span>No carpool <span class="k early"></span>Early dismissal</div>
+    ${ledger([['Owed to you', money(owed), owed ? 'hl' : ''], ['Overdue', overdue, overdue ? 'bad' : ''], ['Next bill', shortDate(nextBillDate())]])}
+    ${cal ? `<div class="banner ${cal.type}"><b>${cal.type === 'off' ? 'No carpool' : 'Early dismissal'}${cal.type === 'early' && cal.time ? ' · pickup ' + niceTime(cal.time) : ''}</b><span>${esc(cal.label || '')}${cal.end && cal.end !== cal.start ? ` · ${shortDate(cal.start)} – ${shortDate(cal.end)}` : ''}</span></div>` : ''}`;
+  if (cal && cal.type === 'off') {
+    html += upcoming.length ? `<div class="eyebrow" style="margin-top:22px">Coming up</div><div class="panel list">${upcoming.map(calRow).join('')}</div>` : '';
+    return html;
+  }
   if (!state.riders.length) {
-    html += `<div class="card empty">Welcome! Start by adding the people in your carpool.<div class="actions" style="justify-content:center"><button class="primary" data-act="addRider">${ic('plus')}Add a rider</button><button data-act="loadDemo">Try with sample data</button></div></div>`;
+    html += `<div class="panel empty"><div class="display sm">Let's get rolling.</div><p>Add the people in your carpool, then set up your routes.</p><div class="actions"><button class="primary" data-act="addRider">${ic('plus')}Add a rider</button><button class="ghost" data-act="loadDemo">Try sample data</button></div></div>`;
   } else if (!routesToday.length) {
-    html += `<div class="card empty">No routes on ${DAYS[dow]}. <button class="link" data-act="goto" data-tab="routes">Set up routes →</button></div>`;
+    html += `<div class="panel empty"><p>No runs scheduled on ${d.toLocaleDateString(undefined, { weekday: 'long' })}.</p><button class="ghost" data-act="goto" data-tab="routes">Set up routes</button></div>`;
   }
   for (const rt of routesToday) {
     const riders = rt.riderIds.map(rider).filter(Boolean);
-    html += `<div class="card">
-      <div class="row between"><div><div class="title">${esc(rt.name)}</div><div class="muted">${niceTime(rt.time)}${rt.destination ? ' → ' + esc(rt.destination) : ''}</div></div>
-      <span class="pill info">${riders.length} rider${riders.length === 1 ? '' : 's'}</span></div>
-      <div style="margin-top:8px">
-      ${riders.map((r) => {
-        const done = state.rides.some((x) => x.date === todayDate && x.routeId === rt.id && x.riderId === r.id);
-        return `<label class="check"><input type="checkbox" data-act="toggleRide" data-route="${rt.id}" data-rider="${r.id}" ${done ? 'checked' : ''}>
-          <span class="grow"><span class="title" style="color:var(--text)">${esc(r.name)}</span><br><span class="small">${esc(r.address || '')}</span></span></label>`;
-      }).join('')}
+    const time = routeTimeOn(rt, todayDate);
+    const note = routeTimeNote(rt, todayDate);
+    const [t, ap] = timeParts(time);
+    html += `<article class="run">
+      <div class="runhead">
+        <div class="clock"><b>${esc(t)}</b><span>${esc(ap)}</span></div>
+        <div class="grow"><div class="kind ${rt.kind || 'dropoff'}">${KIND_LABEL[rt.kind || 'dropoff']}${note ? ` · <em>${esc(note)}</em>` : ''}</div><div class="runname">${esc(rt.name)}</div><div class="runmeta">${riders.length} rider${riders.length === 1 ? '' : 's'}${rt.destination ? ' · ' + esc(rt.destination.split(',')[0]) : ''}</div></div>
       </div>
+      ${stopsHtml(rt, true)}
       <div class="actions">
-        <a class="btn primary" target="_blank" rel="noopener" href="${esc(mapsLink(riders.map((r) => r.address), rt.destination))}">${ic('nav')}Navigate</a>
-        <a class="btn" href="${esc(smsLink(riders.map((r) => r.phone), `Hi! ${state.settings.ownerName} here — on my way for ${rt.name} (${niceTime(rt.time)}).`))}">${ic('msg')}On my way</a>
-        <button data-act="markAll" data-route="${rt.id}">${ic('check')}All present</button>
+        <a class="btn primary" target="_blank" rel="noopener" href="${esc(routeMapsLink(rt))}">${ic('nav')}Navigate</a>
+        <a class="btn" href="${esc(smsLink(riders.map((r) => r.phone), `Hi! ${state.settings.ownerName} here — on my way for ${rt.name} (${niceTime(time)}).`))}">${ic('msg')}On my way</a>
+        <button class="ghost" data-act="markAll" data-route="${rt.id}">${ic('check')}All present</button>
       </div>
-    </div>`;
+    </article>`;
   }
   return html;
 }
 
 function viewRiders() {
   const list = [...state.riders].sort((a, b) => a.name.localeCompare(b.name));
-  return `<h2><span>People in the carpool</span><button class="primary" data-act="addRider">${ic('plus')}Add</button></h2>
-  ${list.length ? '' : '<div class="card empty">No riders yet.</div>'}
-  ${list.map((r) => {
+  const monthly = list.filter((r) => r.rateType === 'month').reduce((a, r) => a + (+r.rate || 0), 0);
+  return `<section class="pagehead"><div><div class="eyebrow">Directory</div><div class="display">Riders</div></div><button class="primary" data-act="addRider">${ic('plus')}Add</button></section>
+  ${list.length ? ledger([['Riders', list.length], ['Monthly billing', money(monthly)]]) : ''}
+  ${list.length ? '' : '<div class="panel empty"><p>No riders yet.</p></div>'}
+  ${list.length ? `<div class="panel list">${list.map((r) => {
     const bal = riderBalance(r.id);
-    return `<div class="card">
-      <div class="row between"><div class="grow"><div class="title">${esc(r.name)}</div>
-        <div class="muted">${r.parent ? 'Parent: ' + esc(r.parent) + ' · ' : ''}${money(r.rate)} ${RATE_LABEL[r.rateType]}</div>
-        <div class="small muted">${esc(r.address || 'No address')}</div></div>
-        <div style="text-align:right"><div class="money">${money(bal)}</div><div class="small muted">owes</div></div></div>
-      <div class="actions">
-        ${r.phone ? `<a class="btn" href="tel:${esc(digits(r.phone))}">${ic('phone')}Call</a><a class="btn" href="${esc(smsLink(r.phone, ''))}">${ic('msg')}Text</a>` : ''}
-        ${r.address ? `<a class="btn" target="_blank" rel="noopener" href="${esc(mapsLink([r.address]))}">${ic('pin')}Map</a>` : ''}
-        <button data-act="editRider" data-id="${r.id}">Edit</button>
+    return `<div class="item">
+      <div class="itemmain">
+        <div class="grow"><div class="itemname">${esc(r.name)}</div>
+          <div class="itemmeta">${r.parent ? esc(r.parent) + ' · ' : ''}${esc(r.address || 'No address')}</div></div>
+        <div class="itemright"><div class="amt">${money(r.rate)}</div><div class="itemmeta">${RATE_LABEL[r.rateType]}</div></div>
+      </div>
+      <div class="itemfoot">
+        ${bal ? `<span class="tag due">Owes ${money(bal)}</span>` : '<span class="tag">Paid up</span>'}
+        <span class="links">
+          ${r.phone ? `<a href="tel:${esc(digits(r.phone))}">Call</a><a href="${esc(smsLink(r.phone, ''))}">Text</a>` : ''}
+          ${r.address ? `<a target="_blank" rel="noopener" href="${esc(mapsLink([r.address]))}">Map</a>` : ''}
+          <button class="textbtn" data-act="editRider" data-id="${r.id}">Edit</button>
+        </span>
       </div></div>`;
-  }).join('')}`;
+  }).join('')}</div>` : ''}`;
+}
+
+function calRow(c) {
+  const range = c.end && c.end !== c.start ? `${shortDate(c.start)} – ${shortDate(c.end)}` : niceDate(c.start);
+  return `<div class="item"><div class="itemmain">
+    <span class="caltag ${c.type}">${c.type === 'off' ? 'Off' : 'Early'}</span>
+    <div class="grow"><div class="itemname">${esc(c.label || (c.type === 'off' ? 'No school' : 'Early dismissal'))}</div>
+    <div class="itemmeta">${range}${c.type === 'early' && c.time ? ' · pickup ' + niceTime(c.time) : ''}</div></div>
+    <button class="textbtn" data-act="editCal" data-id="${c.id}">Edit</button></div></div>`;
 }
 
 function viewRoutes() {
-  return `<h2><span>Routes & alarms</span><button class="primary" data-act="addRoute">${ic('plus')}Add</button></h2>
-  ${state.routes.length ? '' : '<div class="card empty">No routes yet. A route is a trip like "School morning" with its pickup order.</div>'}
-  ${state.routes.map((rt) => `<div class="card">
-    <div class="row between"><div><div class="title">${esc(rt.name)}</div>
-    <div class="muted">${rt.days.map((d) => DAYS[d]).join(', ')} · ${niceTime(rt.time)} · Alert ${rt.remindMin ?? state.settings.remindMin} min before</div></div></div>
-    <div style="margin-top:6px">${rt.riderIds.map(rider).filter(Boolean).map((r, i) => `<div class="stop"><span class="n">${i + 1}</span><span class="grow">${esc(r.name)} <span class="small muted">${esc(r.address || '')}</span></span></div>`).join('')}
-    ${rt.destination ? `<div class="stop"><span class="n end">${ic('flag')}</span><span>${esc(rt.destination)}</span></div>` : ''}</div>
+  const cal = [...(state.calendar || [])].sort((a, b) => a.start.localeCompare(b.start));
+  const today = isoDate(new Date());
+  const future = cal.filter((c) => (c.end || c.start) >= today);
+  const past = cal.length - future.length;
+  return `<section class="pagehead"><div><div class="eyebrow">Runs &amp; alarms</div><div class="display">Routes</div></div><button class="primary" data-act="addRoute">${ic('plus')}Add</button></section>
+  ${state.routes.length ? `<div class="alarmbox">
+    <div><b>Alarms on your iPhone</b><span>One tap adds every drop-off and pickup to your Calendar with an alert before each one. Days off are skipped and early pickups use the earlier time. Tap again after you change a schedule.</span></div>
+    <button class="primary" data-act="icsAll">${ic('bell')}Set all alarms</button>
+  </div>` : ''}
+  ${state.routes.length ? '' : '<div class="panel empty"><p>No routes yet. Add a morning drop-off and an afternoon pickup.</p></div>'}
+  ${state.routes.map((rt) => {
+    const [t, ap] = timeParts(rt.time);
+    const extra = Object.entries(rt.dayTimes || {}).filter(([d, v]) => v && rt.days.includes(+d));
+    return `<article class="run">
+    <div class="runhead">
+      <div class="clock"><b>${esc(t)}</b><span>${esc(ap)}</span></div>
+      <div class="grow"><div class="kind ${rt.kind || 'dropoff'}">${KIND_LABEL[rt.kind || 'dropoff']}</div><div class="runname">${esc(rt.name)}</div>
+      <div class="daystrip">${DAYS.map((d, i) => `<span class="${rt.days.includes(i) ? 'on' : ''}${rt.dayTimes && rt.dayTimes[i] && rt.days.includes(i) ? ' alt' : ''}">${d[0]}</span>`).join('')}</div>
+      ${extra.length ? `<div class="runmeta">${extra.map(([d, v]) => `${DAYS[d]} at ${niceTime(v)}`).join(' · ')}</div>` : ''}</div>
+    </div>
+    ${stopsHtml(rt, false)}
+    <div class="runnote">${ic('bell')}Alert ${rt.remindMin ?? state.settings.remindMin} min before</div>
     <div class="actions">
-      <a class="btn" target="_blank" rel="noopener" href="${esc(mapsLink(rt.riderIds.map(rider).filter(Boolean).map((r) => r.address), rt.destination))}">${ic('nav')}Open route</a>
-      <button data-act="ics" data-id="${rt.id}">${ic('bell')}Add alarm to calendar</button>
-      <button data-act="editRoute" data-id="${rt.id}">Edit</button>
-    </div></div>`).join('')}`;
+      <a class="btn" target="_blank" rel="noopener" href="${esc(routeMapsLink(rt))}">${ic('nav')}Open route</a>
+      <button class="ghost" data-act="ics" data-id="${rt.id}">${ic('bell')}Alarm for this route</button>
+      <button class="ghost" data-act="editRoute" data-id="${rt.id}">Edit</button>
+    </div></article>`;
+  }).join('')}
+  <section class="pagehead" style="margin-top:34px"><div><div class="eyebrow">Days off &amp; early pickups</div><div class="display sm">School calendar</div></div></section>
+  <div class="actions" style="margin:0 0 14px">
+    <button data-act="addCal" data-type="off">${ic('plus')}Day off / break</button>
+    <button data-act="addCal" data-type="early">${ic('plus')}Early dismissal</button>
+  </div>
+  ${future.length ? `<div class="panel list">${future.map(calRow).join('')}</div>` : '<div class="panel empty"><p>Add holidays, vacations and early-dismissal days from the school calendar. Those days show as “No carpool” and alarms skip them.</p></div>'}
+  ${past ? `<div class="itemmeta" style="margin-top:8px">${past} past date${past === 1 ? '' : 's'} hidden.</div>` : ''}`;
 }
 
 function viewBilling() {
   const s = state.settings;
   const invs = state.invoices
     .filter((i) => billingFilter === 'all' || (billingFilter === 'open' ? i.status !== 'paid' : i.status === 'paid'))
-    .sort((a, b) => b.date.localeCompare(a.date));
+    .sort((a, b) => b.date.localeCompare(a.date) || b.number - a.number);
   const owed = state.invoices.filter((i) => i.status !== 'paid').reduce((a, i) => a + i.total, 0);
   const paidMonth = state.invoices.filter((i) => i.status === 'paid' && (i.paidDate || '').slice(0, 7) === isoDate(new Date()).slice(0, 7)).reduce((a, i) => a + i.total, 0);
   return `
-  <div class="stats">
-    <div class="stat"><b class="money">${money(owed)}</b><span>Outstanding</span></div>
-    <div class="stat"><b class="money">${money(paidMonth)}</b><span>Paid this month</span></div>
-    <div class="stat"><b>${niceDate(nextBillDate()).replace(/^\w+, /, '')}</b><span>Next bill (${s.cycle === 'week' ? 'weekly' : 'monthly'})</span></div>
-  </div>
-  ${!s.zelle ? `<div class="card notice">Add your Zelle email or phone in <button class="link" data-act="goto" data-tab="settings">Settings</button> so it shows on invoices.</div>` : ''}
-  <div class="actions" style="margin-bottom:12px">
+  <section class="pagehead"><div><div class="eyebrow">Outstanding</div><div class="display big">${money(owed)}</div></div></section>
+  ${ledger([['Collected', money(paidMonth)], ['Next bill', shortDate(nextBillDate())], ['Cycle', s.cycle === 'week' ? 'Weekly' : 'Monthly']])}
+  ${!s.zelle ? `<div class="notice">Add your Zelle email or phone in <button class="textbtn" data-act="goto" data-tab="settings">Settings</button> so it prints on every invoice.</div>` : ''}
+  <div class="actions" style="margin:0 0 22px">
     <button class="primary" data-act="billAll">${ic('receipt')}Bill all riders</button>
-    <button data-act="newInvoice">${ic('plus')}Single invoice</button>
+    <button class="ghost" data-act="newInvoice">${ic('plus')}Single invoice</button>
   </div>
-  <h2><span>Bills</span>
-    <select data-act="filter" style="width:auto">
-      ${['open', 'paid', 'all'].map((f) => `<option value="${f}" ${billingFilter === f ? 'selected' : ''}>${{ open: 'Unpaid', paid: 'Paid', all: 'All' }[f]}</option>`).join('')}
-    </select></h2>
-  ${invs.length ? '' : '<div class="card empty">No bills here.</div>'}
+  <div class="seg" role="tablist">
+    ${['open', 'paid', 'all'].map((f) => `<button data-act="filter" data-f="${f}" class="${billingFilter === f ? 'on' : ''}">${{ open: 'Unpaid', paid: 'Paid', all: 'All' }[f]}</button>`).join('')}
+  </div>
+  ${invs.length ? '' : '<div class="panel empty"><p>Nothing here.</p></div>'}
   ${invs.map((inv) => {
     const r = rider(inv.riderId) || { name: '(deleted rider)' };
     const st = invoiceStatus(inv);
-    return `<div class="card">
-      <div class="row between"><div class="grow"><div class="title">${esc(r.name)} <span class="muted small">#${inv.number}</span></div>
-      <div class="muted small">Sent ${niceDate(inv.date)} · Due ${niceDate(inv.due)}${inv.paidDate ? ` · Paid ${niceDate(inv.paidDate)} via ${esc(inv.method)}` : ''}</div></div>
-      <div style="text-align:right"><div class="money">${money(inv.total)}</div><span class="pill ${st}">${st}</span></div></div>
-      <div class="actions">
-        ${inv.status !== 'paid' ? `
-          ${r.phone ? `<a class="btn primary" href="${esc(smsLink(r.phone, invoiceText(inv)))}">${ic('msg')}Text invoice</a>` : '<span class="muted small">Add a phone number to text this bill</span>'}
-          ${r.email ? `<a class="btn" href="mailto:${esc(r.email)}?subject=${encodeURIComponent(`${s.poolName} invoice #${inv.number}`)}&body=${encodeURIComponent(invoiceText(inv))}">${ic('mail')}Email</a>` : ''}
-          <button data-act="markPaid" data-id="${inv.id}">${ic('check')}Mark paid</button>` :
-          `<button data-act="markUnpaid" data-id="${inv.id}">Undo paid</button>`}
-        <button data-act="copyInvoice" data-id="${inv.id}">Copy</button>
-        <button class="danger" data-act="delInvoice" data-id="${inv.id}">Delete</button>
-      </div></div>`;
+    return `<article class="ticket ${st}">
+      <div class="stub">
+        <span class="stublabel">No.</span><b>${inv.number}</b>
+        <span class="stublabel">Due</span><b class="small">${shortDate(inv.due)}</b>
+      </div>
+      <div class="tbody">
+        <div class="row between">
+          <div class="grow"><div class="itemname">${esc(r.name)}</div>
+          <div class="itemmeta">${esc(inv.items.map((i) => i.desc).join(', '))}</div></div>
+          <div class="amt lg">${money(inv.total)}</div>
+        </div>
+        <div class="stamp ${st}">${st === 'paid' ? `Paid · ${esc(inv.method)} · ${shortDate(inv.paidDate)}` : st}</div>
+        <div class="actions">
+          ${inv.status !== 'paid' ? `
+            ${r.phone ? `<a class="btn primary" href="${esc(smsLink(r.phone, invoiceText(inv)))}">${ic('msg')}Text invoice</a>` : ''}
+            ${r.email ? `<a class="btn" href="mailto:${esc(r.email)}?subject=${encodeURIComponent(`${s.poolName} invoice #${inv.number}`)}&body=${encodeURIComponent(invoiceText(inv))}">${ic('mail')}Email</a>` : ''}
+            <button data-act="markPaid" data-id="${inv.id}">${ic('check')}Mark paid</button>` :
+            `<button class="ghost" data-act="markUnpaid" data-id="${inv.id}">Undo paid</button>`}
+          <span class="links"><button class="textbtn" data-act="copyInvoice" data-id="${inv.id}">Copy</button><button class="textbtn danger" data-act="delInvoice" data-id="${inv.id}">Delete</button></span>
+        </div>
+        ${!r.phone && inv.status !== 'paid' ? '<div class="itemmeta">Add a phone number to this rider to text the invoice.</div>' : ''}
+      </div>
+    </article>`;
   }).join('')}`;
 }
 
 function viewSettings() {
   const s = state.settings;
   const notif = 'Notification' in window ? Notification.permission : 'unsupported';
-  return `<h2>Settings</h2>
-  <div class="card">
+  return `<section class="pagehead"><div><div class="eyebrow">Your carpool</div><div class="display">Settings</div></div></section>
+  <div class="panel pad">
     <label>Carpool name</label><input data-set="poolName" value="${esc(s.poolName)}">
     <div class="grid2">
       <div><label>Your name</label><input data-set="ownerName" value="${esc(s.ownerName)}"></div>
@@ -355,7 +505,7 @@ function viewSettings() {
     <label>Starting address (for routes)</label><input data-set="homeAddress" value="${esc(s.homeAddress)}" placeholder="Where you start driving from">
   </div>
   <h2>Getting paid</h2>
-  <div class="card">
+  <div class="panel pad">
     <div class="grid2">
       <div><label>Zelle email or phone</label><input data-set="zelle" value="${esc(s.zelle)}"></div>
       <div><label>Name on Zelle</label><input data-set="zelleName" value="${esc(s.zelleName)}"></div>
@@ -374,21 +524,21 @@ function viewSettings() {
     </div>
   </div>
   <h2>Reminders</h2>
-  <div class="card">
+  <div class="panel pad">
     <div class="muted">Best on iPhone: on the Routes tab tap <b>"Add alarm to iPhone calendar"</b> — the alarm then rings even when this app is closed.</div>
     <div class="actions"><button data-act="notify">${ic('bell')}Enable notifications (${notif})</button></div>
   </div>
   <h2>Backup</h2>
-  <div class="card">
+  <div class="panel pad">
     <div class="muted">Your data is saved on this device only. Export a backup to move it to another phone or computer.</div>
     <div class="actions">
       <button data-act="export">${ic('download')}Export backup</button>
-      <label class="btn" style="margin:0;color:var(--text);font-size:15px">${ic('upload')}Import backup<input type="file" accept=".json" data-act="import" hidden></label>
+      <label class="btn" >${ic('upload')}Import backup<input type="file" accept=".json" data-act="import" hidden></label>
       <button class="danger" data-act="reset">Erase all data</button>
     </div>
   </div>
   <h2>Install on iPhone</h2>
-  <div class="card muted">Open this page in <b>Safari</b> → tap the <b>Share</b> button → <b>Add to Home Screen</b>. It will open full-screen like a regular app.</div>`;
+  <div class="panel pad muted">Open this page in <b>Safari</b> → tap the <b>Share</b> button → <b>Add to Home Screen</b>. It will open full-screen like a regular app.</div>`;
 }
 
 // ---------- forms ----------
@@ -441,16 +591,24 @@ function riderForm(r) {
 
 function routeForm(rt) {
   const isNew = !rt;
-  rt = rt || { days: [1, 2, 3, 4, 5], time: '07:30', riderIds: [], remindMin: state.settings.remindMin };
+  rt = rt || { kind: 'dropoff', days: [0, 1, 2, 3, 4], time: '07:30', dayTimes: {}, riderIds: [], remindMin: state.settings.remindMin };
+  const dayTimes = rt.dayTimes || {};
   const order = [...rt.riderIds, ...state.riders.map((r) => r.id).filter((id) => !rt.riderIds.includes(id))];
   openModal(`<h3>${isNew ? 'Add route' : 'Edit route'}</h3>
-    <label>Route name *</label><input name="name" required value="${esc(rt.name)}" placeholder="e.g. School – morning">
+    <label>Type</label>
+    <div class="seg full">${['dropoff', 'pickup'].map((k) => `<label class="${(rt.kind || 'dropoff') === k ? 'on' : ''}"><input type="radio" name="kind" value="${k}" ${(rt.kind || 'dropoff') === k ? 'checked' : ''} onchange="this.closest('.seg').querySelectorAll('label').forEach(l=>l.classList.toggle('on', l.contains(this)))">${k === 'dropoff' ? 'Drop-off (morning)' : 'Pickup (afternoon)'}</label>`).join('')}</div>
+    <label>Route name *</label><input name="name" required value="${esc(rt.name)}" placeholder="e.g. School — morning">
     <label>Days</label><div class="days">${DAYS.map((d, i) => `<label><input type="checkbox" name="day" value="${i}" ${rt.days.includes(i) ? 'checked' : ''}>${d}</label>`).join('')}</div>
     <div class="grid2">
-      <div><label>Pickup start time</label><input name="time" type="time" value="${esc(rt.time)}"></div>
-      <div><label>Alarm (min before)</label><input name="remindMin" type="number" min="0" value="${esc(rt.remindMin)}"></div>
+      <div><label>Usual time</label><input name="time" type="time" value="${esc(rt.time)}"></div>
+      <div><label>Alert (min before)</label><input name="remindMin" type="number" min="0" value="${esc(rt.remindMin)}"></div>
     </div>
-    <label>Destination (school, office…)</label><input name="destination" value="${esc(rt.destination)}">
+    <details class="daytimes" ${Object.values(dayTimes).some(Boolean) ? 'open' : ''}>
+      <summary>Different time on some days (e.g. early Friday)</summary>
+      <div class="dtgrid">${DAYS.map((d, i) => `<label>${d}<input name="dt_${i}" type="time" value="${esc(dayTimes[i] || '')}"></label>`).join('')}</div>
+      <div class="itemmeta">Leave blank to use the usual time.</div>
+    </details>
+    <label>School / destination</label><input name="destination" value="${esc(rt.destination)}">
     <label>Riders in pickup order (number = stop #, blank = not on this route)</label>
     ${order.map(rider).filter(Boolean).map((r) => {
       const i = rt.riderIds.indexOf(r.id);
@@ -460,9 +618,32 @@ function routeForm(rt) {
     if (action === 'delete') { if (confirm('Delete this route?')) { state.routes = state.routes.filter((x) => x.id !== rt.id); save(); } return; }
     if (!d._days.length) { alert('Pick at least one day'); return false; }
     const riderIds = Object.entries(d).filter(([k, v]) => k.startsWith('ord_') && v).sort((a, b) => a[1] - b[1]).map(([k]) => k.slice(4));
-    const obj = { name: d.name.trim(), days: d._days, time: d.time, remindMin: +d.remindMin, destination: d.destination.trim(), riderIds };
+    const dts = {};
+    DAYS.forEach((_, i) => { if (d['dt_' + i] && d['dt_' + i] !== d.time) dts[i] = d['dt_' + i]; });
+    const obj = { kind: d.kind || 'dropoff', name: d.name.trim(), days: d._days, time: d.time, dayTimes: dts, remindMin: +d.remindMin, destination: d.destination.trim(), riderIds };
     if (isNew) state.routes.push({ id: uid(), ...obj }); else Object.assign(rt, obj);
-    toast('Route saved');
+    toast('Route saved — tap “Set all alarms” to update your iPhone');
+  });
+}
+
+function calForm(c, type) {
+  const isNew = !c;
+  c = c || { type, start: isoDate(new Date()), end: '', label: '', time: '12:00' };
+  openModal(`<h3>${c.type === 'off' ? 'Day off / break' : 'Early dismissal'}</h3>
+    <label>What is it?</label><input name="label" value="${esc(c.label)}" placeholder="${c.type === 'off' ? 'e.g. Sukkot break, Thanksgiving' : 'e.g. Rosh Chodesh, half day'}">
+    <div class="grid2">
+      <div><label>${c.type === 'off' ? 'First day' : 'Date'}</label><input name="start" type="date" required value="${esc(c.start)}"></div>
+      ${c.type === 'off'
+        ? `<div><label>Last day (if more than one)</label><input name="end" type="date" value="${esc(c.end && c.end !== c.start ? c.end : '')}"></div>`
+        : `<div><label>Pickup time that day</label><input name="time" type="time" required value="${esc(c.time)}"></div>`}
+    </div>
+    ${modalButtons(!isNew)}`, (d, action) => {
+    if (action === 'delete') { state.calendar = state.calendar.filter((x) => x.id !== c.id); save(); return; }
+    const end = d.end && d.end > d.start ? d.end : d.start;
+    const obj = { type: c.type, label: d.label.trim(), start: d.start, end, time: d.time || '' };
+    state.calendar = state.calendar || [];
+    if (isNew) state.calendar.push({ id: uid(), ...obj }); else Object.assign(c, obj);
+    toast('Saved — tap “Set all alarms” to update your iPhone');
   });
 }
 
@@ -508,12 +689,18 @@ function paidForm(inv) {
 
 // ---------- actions ----------
 const actions = {
+  filter: (el) => { billingFilter = el.dataset.f; render(); },
   goto: (el) => { tab = el.dataset.tab; render(); window.scrollTo(0, 0); },
   addRider: () => riderForm(),
   editRider: (el) => riderForm(rider(el.dataset.id)),
   addRoute: () => routeForm(),
   editRoute: (el) => routeForm(route(el.dataset.id)),
-  ics: (el) => { const rt = route(el.dataset.id); download(`${rt.name.replace(/\W+/g, '-')}.ics`, routeIcs(rt), 'text/calendar'); toast('Open the file and tap "Add All" to set the alarm'); },
+  ics: (el) => { const rt = route(el.dataset.id); download(`${rt.name.replace(/\W+/g, '-')}.ics`, buildIcs([rt]), 'text/calendar'); toast('Open the file, then tap Add All'); },
+  icsAll: () => { download('carpool-alarms.ics', buildIcs(state.routes), 'text/calendar'); toast('Open the file, then tap Add All'); },
+  addCal: (el) => calForm(null, el.dataset.type),
+  editCal: (el) => calForm(state.calendar.find((c) => c.id === el.dataset.id)),
+  pickDay: (el) => { todayDate = el.dataset.d; render(); },
+  shiftWeek: (el) => { todayDate = addDays(todayDate, +el.dataset.n); render(); },
   markAll: (el) => {
     const rt = route(el.dataset.route);
     rt.riderIds.forEach((rid) => setRide(rt.id, rid, true));
@@ -578,8 +765,7 @@ document.addEventListener('change', (e) => {
   }
   switch (el.dataset.act) {
     case 'setDate': todayDate = el.value || isoDate(new Date()); render(); break;
-    case 'filter': billingFilter = el.value; render(); break;
-    case 'toggleRide': if (setRide(el.dataset.route, el.dataset.rider, el.checked) === false) el.checked = true; save(); break;
+        case 'toggleRide': if (setRide(el.dataset.route, el.dataset.rider, el.checked) === false) el.checked = true; save(); break;
     case 'import': {
       const f = el.files[0]; if (!f) return;
       f.text().then((t) => {
@@ -598,9 +784,14 @@ function loadDemo() {
   const c = { id: uid(), name: 'Moshe Klein', parent: 'Rivka Klein', phone: '555-201-3333', email: '', address: '7 Pine Ct, Lakewood, NJ', rate: 150, rateType: 'month', notes: '' };
   state.riders.push(a, b, c);
   state.routes.push(
-    { id: uid(), name: 'School – morning', days: [0, 1, 2, 3, 4], time: '07:30', remindMin: 15, destination: 'Main Street School, Lakewood, NJ', riderIds: [a.id, b.id, c.id] },
-    { id: uid(), name: 'School – pickup', days: [0, 1, 2, 3, 4], time: '15:45', remindMin: 20, destination: '', riderIds: [c.id, b.id, a.id] },
+    { id: uid(), kind: 'dropoff', name: 'School — morning', days: [0, 1, 2, 3, 4, 5], time: '07:30', dayTimes: {}, remindMin: 15, destination: 'Main Street School, Lakewood, NJ', riderIds: [a.id, b.id, c.id] },
+    { id: uid(), kind: 'pickup', name: 'School — afternoon', days: [0, 1, 2, 3, 4, 5], time: '15:45', dayTimes: { 5: '12:30' }, remindMin: 20, destination: 'Main Street School, Lakewood, NJ', riderIds: [c.id, b.id, a.id] },
   );
+  const t = isoDate(new Date());
+  state.calendar = [
+    { id: uid(), type: 'early', label: 'Half day', start: addDays(t, 2), end: addDays(t, 2), time: '12:00' },
+    { id: uid(), type: 'off', label: 'Winter break', start: addDays(t, 9), end: addDays(t, 13), time: '' },
+  ];
 }
 
 // ---------- boot ----------
