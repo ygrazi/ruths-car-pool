@@ -1,0 +1,19 @@
+rules_version = '2';
+// Only the carpool owners can read or change anything, and only after confirming their email.
+// To give someone else access, add their email to the list and redeploy.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function member() {
+      return request.auth != null
+        && request.auth.token.email_verified == true
+        && request.auth.token.email in ['ygrazi@gmail.com', 'ruthiegrazi52@gmail.com'];
+    }
+    match /pools/main {
+      allow read, write: if member();
+    }
+    match /pools/main/{col}/{docId} {
+      allow read, write: if member()
+        && col in ['riders', 'routes', 'rides', 'invoices', 'calendar', 'absences', 'backups'];
+    }
+  }
+}

@@ -17,6 +17,8 @@ A carpool management app that runs in any web browser and installs on iPhone lik
 2. Tap **Share** → **Add to Home Screen**
 
 ## Notes
-- Data is saved on the device that uses it. Live tracking, schedule updates for parents and absence reports pass through the free ntfy.sh relay, end-to-end encrypted (AES-GCM) with a key that exists only in the private parent links. Push alert texts (e.g. "Leah was picked up at 7:41") are short plain text. Maps: OpenStreetMap; arrival times: OSRM; address lookup: Nominatim.
+- Data is stored online in Firebase (project `ruths-car-pool-app`) and syncs live between devices. Only the emails in `firestore.rules` (and `ALLOWED_EMAILS` in `cloud.js`) can sign in, after confirming their email. Each device also keeps an offline copy.
+- Backups: automatic daily copies online (30 days) and on each device (7 days); restore from Settings → Backups.
+- Older note: before sync, data was saved only on the device that used it. Live tracking, schedule updates for parents and absence reports pass through the free ntfy.sh relay, end-to-end encrypted (AES-GCM) with a key that exists only in the private parent links. Push alert texts (e.g. "Leah was picked up at 7:41") are short plain text. Maps: OpenStreetMap; arrival times: OSRM; address lookup: Nominatim.
 - iPhone only shares location from a web app while it is open on screen, so keep the app open in a phone mount during a run. Use Settings → Export backup to move it to another device.
 - Zelle has no public API for small businesses, so the app puts your Zelle email/phone on each invoice and you mark it paid when the money arrives.

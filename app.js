@@ -54,12 +54,18 @@ function load() {
       }
       return st;
     }
-  } catch (e) { console.warn('load failed', e); }
+  } catch (e) {
+    // Never let a damaged save be overwritten: keep the raw copy so it can be recovered.
+    console.warn('load failed', e);
+    try { const raw = localStorage.getItem(STORE_KEY); if (raw) localStorage.setItem(STORE_KEY + '.damaged.' + Date.now(), raw); } catch {}
+  }
   return structuredClone(DEFAULT_STATE);
 }
 function save() {
   try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
   catch (e) { toast('Could not save on this device'); }
+  localBackup();
+  if (typeof cloudPush === 'function') cloudPush();
 }
 
 // ---------- helpers ----------
@@ -538,6 +544,9 @@ function render() {
   $('#poolName').textContent = state.settings.poolName;
   document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
   const v = $('#view');
+  const blocked = cloudBlocking();
+  document.body.classList.toggle('authing', blocked);
+  if (blocked) { v.innerHTML = viewAuth(); return; }
   v.innerHTML = ({ today: viewToday, riders: viewRiders, routes: viewRoutes, billing: viewBilling, settings: viewSettings })[tab]();
 }
 
@@ -804,11 +813,19 @@ function viewSettings() {
     <p class="muted">During a run, keep this app open on screen (in a phone mount). iPhone stops sharing location from web apps that are in the background.</p>
     <div class="actions"><button class="danger ghost" data-act="resetLinks">Make new links (old links stop working)</button></div>
   </div>
-  <h2>Backup</h2>
+  <h2>Devices &amp; sync</h2>
   <div class="panel pad">
-    <div class="muted">Your data is saved on this device only. Export a backup to move it to another phone or computer.</div>
+    ${cloud.auth_state !== 'in' ? '<p class="muted">Online sync is not available right now — your data is saved on this device.</p>'
+      : `<p><b id="syncState">${esc(syncLabel())}</b></p>
+        <p class="muted">Signed in as ${esc(cloud.user.email)}. Everything you change shows up on every phone and computer signed in to this carpool (${ALLOWED_EMAILS.map(esc).join(' and ')}).</p>
+        <div class="actions"><button class="ghost" data-act="signOut">Sign out of this device</button></div>`}
+  </div>
+  <h2>Backups</h2>
+  <div class="panel pad">
+    <p class="muted">Automatic: once a day the app saves a copy online (kept 30 days) and on this device (kept 7 days). If something gets deleted by mistake, restore it here.</p>
     <div class="actions">
-      <button data-act="export">${ic('download')}Export backup</button>
+      <button class="primary" data-act="restore">${ic('upload')}Restore a backup</button>
+      <button data-act="export">${ic('download')}Download backup file</button>
       <label class="btn" >${ic('upload')}Import backup<input type="file" accept=".json" data-act="import" hidden></label>
       <button class="danger" data-act="reset">Erase all data</button>
     </div>
@@ -989,6 +1006,22 @@ const actions = {
     });
     save(); render(); toast(rt.kind === 'pickup' ? 'All dropped off' : 'All picked up');
   },
+  ...authActions,
+  restore: async () => {
+    const list = await listBackups();
+    if (!list.length) return toast('No backups yet — the first one is made today');
+    openModal(`<h3>Restore a backup</h3>
+      <p class="muted">Pick a day. Everything goes back to how it was at the start of that day (riders, routes, bills, settings). Your current data is kept as “Before last restore” in case you change your mind.</p>
+      <label>Backup</label><select name="pick">${list.map((b, i) => `<option value="${i}">${esc(/^\d{4}-/.test(b.id) ? niceDate(b.id) : b.id)} · ${esc(b.where)}${b.by ? ' · ' + esc(b.by) : ''}</option>`).join('')}</select>
+      <div class="actions" style="justify-content:flex-end;margin-top:16px"><button value="cancel" formnovalidate>Cancel</button><button class="primary danger-fill" value="save">Restore</button></div>`, (d) => {
+      const b = list[+d.pick];
+      let data;
+      try { data = b.load(); } catch { toast('That backup could not be read'); return false; }
+      if (!confirm(`Replace everything with the backup from ${/^\d{4}-/.test(b.id) ? niceDate(b.id) : b.id}?`)) return false;
+      restoreBackup(data);
+      toast('Backup restored');
+    });
+  },
   goLive: (el) => startLive(el.dataset.route),
   stopLive: () => { if (confirm('End this run? Parents will see that the run is finished.')) stopLive(); },
   toggleMap: () => { state.settings.liveMapHidden = !state.settings.liveMapHidden; save(); const m = $('#livemap'); if (m) m.hidden = state.settings.liveMapHidden; if (!m.hidden) updateLiveMap(); },
@@ -1106,6 +1139,8 @@ function loadDemo() {
 // ---------- boot ----------
 document.querySelectorAll('[data-ic]').forEach((el) => (el.innerHTML = ic(el.dataset.ic)));
 render();
+localBackup();
+cloudStart();
 setInterval(checkReminders, 30000); checkReminders();
 ensureCoords();
 pollInbox(); setInterval(pollInbox, 120000);

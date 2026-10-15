@@ -366,3 +366,9 @@ body.parent { padding-bottom: 40px; }
 .status.soon .eyebrow, .status.soon .itemmeta { color: #1c1a16; }
 .status.idle { box-shadow: none; border-color: var(--line); }
 .dayname { width: 96px; flex: none; }
+
+/* ---------- Sign-in ---------- */
+body.authing .tabs, body.authing #live { display: none; }
+.authbox { background: var(--card); border: 1.5px solid var(--ink); border-radius: 8px; padding: 20px; box-shadow: 4px 4px 0 var(--ink); max-width: 440px; margin: 10px auto; }
+.authbox p { margin: 10px 0 0; }
+.autherr { color: var(--red); font-weight: 700; font-size: 14px; min-height: 20px; margin-top: 10px; }

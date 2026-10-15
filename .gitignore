@@ -1,3 +1,6 @@
 .claude/
 *.json.bak
 ruths-carpool-backup-*.json
+.firebaserc
+.firebase/
+firebase-debug.log
