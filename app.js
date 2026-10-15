@@ -166,11 +166,25 @@ function routeMapsLink(rt, date) {
   if (rt.kind === 'pickup' && rt.destination) return mapsLink([rt.destination, ...homes]);
   return mapsLink(homes, rt.destination);
 }
-function paymentLines(amount) {
+const venmoUser = () => String(state.settings.venmo || '').trim().replace(/^@/, '').replace(/[^\w-]/g, '');
+// Venmo's web link opens the Venmo app with recipient, amount and note filled in.
+function venmoLink(amount, note) {
+  return `https://venmo.com/${venmoUser()}?txn=pay&amount=${(+amount).toFixed(2)}&note=${encodeURIComponent(note || '')}`;
+}
+function paymentLines(amount, invNumber) {
   const s = state.settings;
+  const zelleLink = /^https:\/\//.test(s.zelleLink || '') ? s.zelleLink : '';
   const lines = [];
-  if (s.zelle) lines.push(`Zelle: ${s.zelle}${s.zelleName ? ` (${s.zelleName})` : ''} — open your bank app → Zelle → send ${money(amount)}`);
-  if (s.venmo) lines.push(`Venmo: https://venmo.com/${s.venmo.replace(/^@/, '')}?txn=pay&amount=${(+amount).toFixed(2)}`);
+  if (s.zelle || zelleLink) {
+    lines.push('', `PAY WITH ZELLE — ${money(amount)}`);
+    // Email/phone on its own line so phones make it tap-to-copy.
+    if (s.zelle) lines.push(`Send to: ${s.zelle}`, ...(s.zelleName ? [`Name: ${s.zelleName}`] : []));
+    lines.push(zelleLink ? `Tap to pay: ${zelleLink}` : 'Open your bank app → Zelle → Send.');
+  }
+  if (venmoUser()) {
+    lines.push('', `${lines.length ? 'OR ' : ''}PAY WITH VENMO — ${money(amount)}`,
+      `Tap to pay: ${venmoLink(amount, `${s.poolName}${invNumber ? ' invoice ' + invNumber : ''}`)}`);
+  }
   return lines;
 }
 function invoiceText(inv) {
@@ -181,7 +195,8 @@ function invoiceText(inv) {
     `Hi ${r.parent || r.name || ''}! Here is the carpool bill for ${r.name || ''}.`,
     ...inv.items.map((it) => `• ${it.desc}: ${money(it.amount)}`),
     `Total due: ${money(inv.total)} by ${niceDate(inv.due)}`,
-    ...paymentLines(inv.total),
+    ...paymentLines(inv.total, inv.number),
+    '',
     `Please put "Invoice ${inv.number}" in the memo. Thank you! — ${s.ownerName}`,
   ].join('\n');
 }
@@ -725,7 +740,7 @@ function viewBilling() {
   return `
   <section class="pagehead"><div><div class="eyebrow">Outstanding</div><div class="display big">${money(owed)}</div></div></section>
   ${ledger([['Collected', money(paidMonth)], ['Next bill', shortDate(nextBillDate())], ['Cycle', s.cycle === 'week' ? 'Weekly' : 'Monthly']])}
-  ${!s.zelle ? `<div class="notice">Add your Zelle email or phone in <button class="textbtn" data-act="goto" data-tab="settings">Settings</button> so it prints on every invoice.</div>` : ''}
+  ${!s.zelle && !s.zelleLink && !s.venmo ? `<div class="notice">Add your Zelle and/or Venmo in <button class="textbtn" data-act="goto" data-tab="settings">Settings</button> so payment details print on every invoice.</div>` : ''}
   <div class="actions" style="margin:0 0 22px">
     <button class="primary" data-act="billAll">${ic('receipt')}Bill all riders</button>
     <button class="ghost" data-act="newInvoice">${ic('plus')}Single invoice</button>
@@ -781,7 +796,15 @@ function viewSettings() {
       <div><label>Zelle email or phone</label><input data-set="zelle" value="${esc(s.zelle)}"></div>
       <div><label>Name on Zelle</label><input data-set="zelleName" value="${esc(s.zelleName)}"></div>
     </div>
-    <label>Venmo username (optional)</label><input data-set="venmo" value="${esc(s.venmo)}" placeholder="@username">
+    <label>Zelle QR link (optional)</label><input data-set="zelleLink" type="url" value="${esc(s.zelleLink || '')}" placeholder="https://…">
+    <details class="daytimes"><summary>How to get your Zelle QR link</summary>
+      <ol class="small"><li>In your bank app open <b>Zelle</b> → settings → <b>My QR code</b>, and take a screenshot.</li>
+      <li>Open the screenshot in Photos, press and hold the QR code, and tap <b>Copy link</b> (or scan it with another phone’s camera).</li>
+      <li>Paste it in the box above. It will appear on every invoice as “Tap to pay”.</li></ol>
+      <div class="itemmeta">Zelle can’t fill in the amount, so the invoice shows the amount right above the link.</div>
+    </details>
+    <label>Venmo username (optional)</label><input data-set="venmo" value="${esc(s.venmo)}" placeholder="@username" autocapitalize="off" autocorrect="off">
+    <div class="itemmeta">In the Venmo app tap <b>Me</b> — it’s the name starting with @ under your photo. Invoices then include a “Tap to pay” link that opens Venmo with your name, the amount and the invoice number filled in.</div>
     <div class="grid2">
       <div><label>Bill every</label><select data-set="cycle"><option value="month" ${s.cycle === 'month' ? 'selected' : ''}>Month</option><option value="week" ${s.cycle === 'week' ? 'selected' : ''}>Week</option></select></div>
       <div><label>${s.cycle === 'week' ? 'On' : 'On day of month'}</label>
