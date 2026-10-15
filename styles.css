@@ -372,3 +372,6 @@ body.authing .tabs, body.authing #live { display: none; }
 .authbox { background: var(--card); border: 1.5px solid var(--ink); border-radius: 8px; padding: 20px; box-shadow: 4px 4px 0 var(--ink); max-width: 440px; margin: 10px auto; }
 .authbox p { margin: 10px 0 0; }
 .autherr { color: var(--red); font-weight: 700; font-size: 14px; min-height: 20px; margin-top: 10px; }
+button.google { width: 100%; justify-content: center; gap: 10px; min-height: 48px; font-size: 15px; margin-top: 16px; background: #fff; color: #1f1f1f; border-color: #1c1a16; }
+.orline { display: flex; align-items: center; gap: 10px; margin: 6px 0 0; color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; }
+.orline::before, .orline::after { content: ""; flex: 1; height: 1px; background: var(--line); }
